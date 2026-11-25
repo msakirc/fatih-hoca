@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fatih_hoca"
+version = "0.1.0"
+description = "Model selection for a mixed local/cloud LLM fleet: 15-dimension scoring, swap budget, pressure-aware ranking."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Sakir Cimen" }]
+keywords = ["llm", "model-selection", "llm-routing", "local-llm", "gpu", "scheduling", "kutai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Framework :: AsyncIO",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "dabidabi @ git+https://github.com/msakirc/dabidabi.git",
+    "kuleden_donen_var @ git+https://github.com/msakirc/kuleden-donen-var.git",
+    "nerd_herd @ git+https://github.com/msakirc/nerd-herd.git",
+    "gguf>=0.18",
+    "httpx>=0.28",
+    "litellm>=1.81",
+    "PyYAML>=6.0",
+    "yazbunu @ git+https://github.com/msakirc/yazbunu.git",
+]
+
+[project.urls]
+Homepage = "https://github.com/msakirc/fatih-hoca"
+Repository = "https://github.com/msakirc/fatih-hoca"
+Monorepo = "https://github.com/msakirc/kutai/tree/main/packages/fatih_hoca"
+
+[tool.setuptools.packages.find]
+where = ["src"]

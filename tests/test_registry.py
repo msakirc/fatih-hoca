@@ -1,0 +1,506 @@
+"""Tests for fatih_hoca.registry — ModelInfo, ModelRegistry, and helpers."""
+
+import pytest
+from fatih_hoca.registry import ModelInfo, ModelRegistry, is_non_chat_model_name
+
+
+# ─── is_non_chat_model_name (scan-time non-chat GGUF filter) ──────────────────
+
+@pytest.mark.parametrize("name", [
+    "nomic-embed-text-v1.5.q4_k_m",
+    "multilingual-e5-large-instruct.q8_0",
+    "bge-large-en-v1.5.f16",
+    "gte-qwen2-7b-instruct.q4_k_m",   # GTE embedder mislabeled "instruct"
+    "jina-reranker-v2-base.q5_k_m",
+    "all-minilm-l6-v2.f16",
+])
+def test_is_non_chat_model_name_flags_embedders(name):
+    assert is_non_chat_model_name(name) is True
+
+
+@pytest.mark.parametrize("name", [
+    "qwen3.5-27b.q4_k_m",
+    "qwen3-coder-32b-instruct-q4_k_m",
+    "meta-llama-3.1-8b-instruct-q5_k_m",
+    "serviceNow-ai_apriel-1.6-15b-thinker-q4_k_l".lower(),
+    "gemma-4-26b-a4b-it-ud-iq4_nl",
+    "glm-4.7-flash-ud-q4_k_xl",
+    "gpt-oss-20b-ud-q4_k_xl",
+])
+def test_is_non_chat_model_name_keeps_chat_models(name):
+    assert is_non_chat_model_name(name) is False
+
+# registry_store isolation fixture lives in conftest.py (autouse).
+
+
+# ─── ModelInfo properties ────────────────────────────────────────────────────
+
+def test_model_info_is_local():
+    m = ModelInfo(name="qwen3-30b", location="local", provider="local",
+                  litellm_name="local/qwen3-30b")
+    assert m.is_local is True
+
+
+def test_model_info_ollama_is_local():
+    m = ModelInfo(name="ollama-llama3", location="ollama", provider="ollama",
+                  litellm_name="ollama/llama3")
+    assert m.is_local is True
+
+
+def test_model_info_is_cloud():
+    m = ModelInfo(name="claude-sonnet", location="cloud", provider="anthropic",
+                  litellm_name="anthropic/claude-sonnet-4-20250514")
+    assert m.is_local is False
+
+
+def test_model_info_is_free_local():
+    m = ModelInfo(name="test", location="local", provider="llama_cpp",
+                  litellm_name="openai/test")
+    assert m.is_free is True
+
+
+def test_model_info_is_free_cloud():
+    m = ModelInfo(name="test", location="cloud", provider="groq",
+                  litellm_name="groq/llama-8b",
+                  cost_per_1k_input=0.0, cost_per_1k_output=0.0,
+                  tier="free")
+    assert m.is_free is True
+
+
+def test_model_info_not_free():
+    m = ModelInfo(name="test", location="cloud", provider="anthropic",
+                  litellm_name="anthropic/claude-sonnet",
+                  cost_per_1k_input=0.003, cost_per_1k_output=0.015,
+                  tier="paid")
+    assert m.is_free is False
+
+
+def test_model_info_estimated_cost_local():
+    m = ModelInfo(name="test", location="local", provider="local",
+                  litellm_name="local/test",
+                  cost_per_1k_input=0.003, cost_per_1k_output=0.015)
+    assert m.estimated_cost(1000, 1000) == 0.0
+
+
+def test_model_info_estimated_cost():
+    m = ModelInfo(name="test", location="cloud", provider="anthropic",
+                  litellm_name="anthropic/claude-sonnet",
+                  cost_per_1k_input=0.003, cost_per_1k_output=0.015)
+    cost = m.estimated_cost(1000, 1000)
+    assert cost > 0
+    assert abs(cost - 0.018) < 1e-9
+
+
+def test_model_info_score_for():
+    m = ModelInfo(name="test", location="local", provider="local",
+                  litellm_name="local/test",
+                  capabilities={"reasoning": 7.0, "code_generation": 8.0})
+    assert m.score_for("reasoning") == 7.0
+    assert m.score_for("nonexistent") == 0.0
+
+
+def test_model_info_best_score():
+    m = ModelInfo(name="test", location="local", provider="local",
+                  litellm_name="local/test",
+                  capabilities={"reasoning": 7.0, "code_generation": 8.5})
+    assert m.best_score() == 8.5
+
+
+def test_model_info_best_score_empty():
+    m = ModelInfo(name="test", location="local", provider="local",
+                  litellm_name="local/test")
+    assert m.best_score() == 0.0
+
+
+def test_model_info_operational_dict():
+    m = ModelInfo(name="test", location="local", provider="llama_cpp",
+                  litellm_name="openai/test",
+                  context_length=16384, max_tokens=4096)
+    d = m.operational_dict()
+    assert d["location"] == "local"
+    assert d["context_length"] == 16384
+    assert d["max_tokens"] == 4096
+    assert "capabilities" not in d  # operational dict excludes capabilities dict
+
+
+# ─── ModelRegistry ────────────────────────────────────────────────────────────
+
+def test_registry_init_empty():
+    reg = ModelRegistry()
+    assert reg.all_models() == []
+
+
+def test_registry_register_and_get():
+    reg = ModelRegistry()
+    m = ModelInfo(name="test", location="local", provider="local",
+                  litellm_name="local/test")
+    reg.register(m)
+    assert reg.get("test") is m
+    assert reg.get("nonexistent") is None
+
+
+def test_registry_all_models():
+    reg = ModelRegistry()
+    m1 = ModelInfo(name="a", location="local", provider="local", litellm_name="local/a")
+    m2 = ModelInfo(name="b", location="cloud", provider="openai", litellm_name="openai/b")
+    reg.register(m1)
+    reg.register(m2)
+    all_m = reg.all_models()
+    assert len(all_m) == 2
+
+
+def test_registry_by_litellm_name():
+    reg = ModelRegistry()
+    m = ModelInfo(name="test", location="cloud", provider="anthropic",
+                  litellm_name="anthropic/claude-sonnet")
+    reg.register(m)
+    assert reg.by_litellm_name("anthropic/claude-sonnet") is m
+    assert reg.by_litellm_name("groq/llama") is None
+
+
+def test_registry_register_overwrites():
+    reg = ModelRegistry()
+    m1 = ModelInfo(name="test", location="local", provider="local",
+                   litellm_name="local/test", context_length=4096)
+    m2 = ModelInfo(name="test", location="local", provider="local",
+                   litellm_name="local/test", context_length=8192)
+    reg.register(m1)
+    reg.register(m2)
+    assert reg.get("test").context_length == 8192
+    assert len(reg.all_models()) == 1
+
+
+def test_registry_local_cloud_filter():
+    reg = ModelRegistry()
+    local = ModelInfo(name="local-model", location="local", provider="llama_cpp",
+                      litellm_name="openai/local-model")
+    cloud = ModelInfo(name="cloud-model", location="cloud", provider="anthropic",
+                      litellm_name="anthropic/claude")
+    reg.register(local)
+    reg.register(cloud)
+    assert len(reg.local_models()) == 1
+    assert reg.local_models()[0].name == "local-model"
+    assert len(reg.cloud_models()) == 1
+    assert reg.cloud_models()[0].name == "cloud-model"
+
+
+def test_registry_vision_models():
+    reg = ModelRegistry()
+    vision = ModelInfo(name="vmodel", location="local", provider="llama_cpp",
+                       litellm_name="openai/vmodel", has_vision=True)
+    plain = ModelInfo(name="plain", location="local", provider="llama_cpp",
+                      litellm_name="openai/plain", has_vision=False)
+    reg.register(vision)
+    reg.register(plain)
+    assert len(reg.vision_models()) == 1
+    assert reg.vision_models()[0].name == "vmodel"
+
+
+def test_registry_thinking_models():
+    reg = ModelRegistry()
+    thinker = ModelInfo(name="tmodel", location="local", provider="llama_cpp",
+                        litellm_name="openai/tmodel", thinking_model=True)
+    plain = ModelInfo(name="plain", location="local", provider="llama_cpp",
+                      litellm_name="openai/plain", thinking_model=False)
+    reg.register(thinker)
+    reg.register(plain)
+    assert len(reg.thinking_models()) == 1
+    assert reg.thinking_models()[0].name == "tmodel"
+
+
+def test_registry_models_with_capability():
+    reg = ModelRegistry()
+    strong = ModelInfo(name="strong", location="local", provider="local",
+                       litellm_name="local/strong",
+                       capabilities={"reasoning": 8.0, "code_generation": 7.0})
+    weak = ModelInfo(name="weak", location="local", provider="local",
+                     litellm_name="local/weak",
+                     capabilities={"reasoning": 3.0, "code_generation": 2.0})
+    reg.register(strong)
+    reg.register(weak)
+    good = reg.models_with_capability("reasoning", min_score=6.0)
+    assert len(good) == 1
+    assert good[0].name == "strong"
+
+
+# ─── Standalone helpers ───────────────────────────────────────────────────────
+
+def test_estimate_capabilities_returns_dict():
+    from fatih_hoca.registry import estimate_capabilities
+    caps = estimate_capabilities(
+        family_key="llama31",
+        total_params_b=8.0,
+        active_params_b=None,
+        quantization="Q4_K_M",
+    )
+    assert isinstance(caps, dict)
+    assert len(caps) > 0
+    for v in caps.values():
+        assert 0.0 <= v <= 10.0
+
+
+def test_estimate_capabilities_unknown_family():
+    from fatih_hoca.registry import estimate_capabilities
+    caps = estimate_capabilities(
+        family_key=None,
+        total_params_b=7.0,
+        active_params_b=None,
+        quantization="Q4_K_M",
+    )
+    assert isinstance(caps, dict)
+
+
+def test_calculate_gpu_layers_zero_on_no_vram():
+    from fatih_hoca.registry import calculate_gpu_layers
+    layers = calculate_gpu_layers(
+        file_size_mb=4000,
+        n_layers=32,
+        available_vram_mb=0,
+        context_length=8192,
+    )
+    assert layers == 0
+
+
+def test_calculate_gpu_layers_positive():
+    from fatih_hoca.registry import calculate_gpu_layers
+    layers = calculate_gpu_layers(
+        file_size_mb=4000,
+        n_layers=32,
+        available_vram_mb=8192,
+        context_length=8192,
+    )
+    assert layers > 0
+    assert layers <= 32
+
+
+def test_detect_function_calling_known_family():
+    from fatih_hoca.registry import detect_function_calling
+    assert detect_function_calling("qwen3", {}) is True
+    assert detect_function_calling("unknown_family_xyz", {}) is False
+
+
+def test_detect_thinking_model():
+    from fatih_hoca.registry import detect_thinking_model
+    assert detect_thinking_model("qwen3") is True
+    assert detect_thinking_model("llama31") is False
+    assert detect_thinking_model(None, "openai/o3-mini") is True
+
+
+def test_resolve_provider_explicit():
+    from fatih_hoca.registry import _resolve_provider
+    assert _resolve_provider("anthropic/claude-sonnet") == "anthropic"
+    assert _resolve_provider("groq/llama3") == "groq"
+    assert _resolve_provider("unknown_prefix/model") is None
+
+
+def test_resolve_provider_inferred():
+    from fatih_hoca.registry import _resolve_provider
+    assert _resolve_provider("claude-3-opus") == "anthropic"
+    assert _resolve_provider("gpt-4o") == "openai"
+
+
+# ─── register_cloud_from_discovered ──────────────────────────────────────────
+
+def test_register_cloud_from_discovered_merges_scraped_fields():
+    from fatih_hoca.cloud.types import DiscoveredModel
+    from fatih_hoca.registry import ModelRegistry, register_cloud_from_discovered
+
+    registry = ModelRegistry()
+    discovered = DiscoveredModel(
+        litellm_name="groq/llama-3.3-70b-versatile",
+        raw_id="llama-3.3-70b-versatile",
+        context_length=131072,
+        max_output_tokens=32768,
+        cost_per_1k_input=0.59,
+        cost_per_1k_output=0.79,
+        sampling_defaults={"temperature": 1.0},
+        extra={"owned_by": "Meta"},
+    )
+    register_cloud_from_discovered(registry, "groq", discovered)
+    m = registry.get("groq/llama-3.3-70b-versatile")
+    assert m is not None
+    assert m.location == "cloud"
+    assert m.provider == "groq"
+    assert m.context_length == 131072
+    assert m.max_tokens == 32768
+    assert m.cost_per_1k_input == 0.59
+    assert m.cost_per_1k_output == 0.79
+    assert m.family == "llama-3.3-70b"
+
+
+def test_register_cloud_skips_inactive():
+    from fatih_hoca.cloud.types import DiscoveredModel
+    from fatih_hoca.registry import ModelRegistry, register_cloud_from_discovered
+
+    registry = ModelRegistry()
+    discovered = DiscoveredModel(
+        litellm_name="groq/dead", raw_id="dead", active=False,
+    )
+    result = register_cloud_from_discovered(registry, "groq", discovered)
+    assert result is None
+    assert registry.get("groq/dead") is None
+
+
+def test_register_cloud_skips_non_text_modality():
+    """Image / TTS / embedding / video models reach the discovery layer
+    alongside chat models on Gemini and OpenRouter. The 15-dim capability
+    vector is text-task oriented; without skipping, the unknown-cloud
+    fallback assigns 6.0 across all dims and the selector picks them for
+    coder roles. Triage in production: gemini/gemini-2.5-flash-image was
+    chosen for a coder task and 403'd on the chat endpoint."""
+    from fatih_hoca.cloud.types import DiscoveredModel
+    from fatih_hoca.registry import ModelRegistry, register_cloud_from_discovered
+
+    registry = ModelRegistry()
+    for modality in ("image", "audio", "embedding", "video"):
+        d = DiscoveredModel(
+            litellm_name=f"gemini/foo-{modality}",
+            raw_id=f"foo-{modality}",
+            output_modality=modality,
+        )
+        result = register_cloud_from_discovered(registry, "gemini", d)
+        assert result is None, f"{modality} should not register"
+        assert registry.get(f"gemini/foo-{modality}") is None
+
+    # Text still registers
+    text = DiscoveredModel(
+        litellm_name="gemini/foo-text", raw_id="foo-text",
+        output_modality="text",
+    )
+    assert register_cloud_from_discovered(registry, "gemini", text) is not None
+    # Default modality (unset) treated as text — back-compat for adapters
+    # that haven't been migrated yet.
+    legacy = DiscoveredModel(litellm_name="gemini/legacy", raw_id="legacy")
+    assert register_cloud_from_discovered(registry, "gemini", legacy) is not None
+
+
+def test_register_cloud_uses_detect_defaults_when_scraped_missing():
+    """Scraped fields are optional — when None, detect_cloud_model() defaults apply."""
+    from fatih_hoca.cloud.types import DiscoveredModel
+    from fatih_hoca.registry import ModelRegistry, register_cloud_from_discovered
+
+    registry = ModelRegistry()
+    discovered = DiscoveredModel(
+        litellm_name="claude-sonnet-4-20250514",
+        raw_id="claude-sonnet-4-20250514",
+        # All scraped fields None.
+    )
+    m = register_cloud_from_discovered(registry, "anthropic", discovered)
+    assert m is not None
+    # detect_cloud_model() must have produced sane defaults.
+    assert m.context_length > 0
+    assert m.max_tokens > 0
+    assert m.location == "cloud"
+    assert m.provider == "anthropic"
+    assert m.family == "claude-sonnet-4"
+
+
+def test_detect_cloud_model_free_suffix_sets_free_tier():
+    """A litellm_name ending in ':free' is authoritatively free, regardless of
+    the provider-level default. openrouter hosts both free and paid models, so
+    the per-model ':free' suffix — not the provider default — must decide tier.
+
+    Live 2026-06-17: openrouter is absent from _FREE_TIER_DEFAULTS, so every
+    openrouter model (incl ':free') got tier='paid' -> is_free=False -> per_call
+    pool -> S9-free-perishability + S12 pool-balance (both gated on is_free)
+    returned 0 -> the 'use-it-before-reset' arm of the utilization equilibrium
+    was amputated, leaving only the conserve side (S4 queue) -> -1.0 floor on
+    all 26 openrouter models -> select=None stall under minimal (cloud-only).
+    """
+    from fatih_hoca.registry import detect_cloud_model
+    info = detect_cloud_model("openrouter/google/gemma-4-31b-it:free", "openrouter")
+    assert info["tier"] == "free", "':free' suffix must be tiered free"
+
+
+def test_detect_cloud_model_paid_openrouter_stays_paid():
+    """Guard: a non-':free' openrouter model must stay paid — the suffix rule
+    must not flip genuinely-paid models to free."""
+    from fatih_hoca.registry import detect_cloud_model
+    info = detect_cloud_model("openrouter/openai/gpt-4o", "openrouter")
+    assert info["tier"] == "paid"
+
+
+def test_registry_mark_dead_excludes_by_either_key():
+    """mark_dead is the runtime kill-switch for a model that 404'd. Set
+    membership keys on BOTH name and litellm_name so eligibility filter
+    excludes regardless of which path queries it."""
+    from fatih_hoca.cloud.types import DiscoveredModel
+    from fatih_hoca.registry import ModelRegistry, register_cloud_from_discovered
+
+    registry = ModelRegistry()
+    discovered = DiscoveredModel(
+        litellm_name="gemini/gemini-2.5-flash-preview-05-20",
+        raw_id="gemini-2.5-flash-preview-05-20",
+        rate_limit_rpm=5, rate_limit_tpm=250000, rate_limit_rpd=20,
+    )
+    register_cloud_from_discovered(registry, "gemini", discovered)
+    name = "gemini/gemini-2.5-flash-preview-05-20"
+    assert registry.is_dead(name) is False
+
+    # Mark dead by litellm_name → name lookup also matches.
+    # Use 404_transient (revivable by auto actors) since the test exercises
+    # both keys after revive — 404_permanent now requires actor != "auto"
+    # by policy and would block the auto-default revive call.
+    registry.mark_dead(name, cause="404_transient")
+    assert registry.is_dead(name) is True
+
+    # Revive clears both keys
+    registry.revive(name)
+    assert registry.is_dead(name) is False
+
+
+def test_registry_mark_dead_safe_with_unknown_id():
+    """mark_dead on an id that isn't registered yet still records the
+    string — caller may invoke before discovery finishes."""
+    from fatih_hoca.registry import ModelRegistry
+    registry = ModelRegistry()
+    registry.mark_dead("gemini/some-future-model")
+    assert registry.is_dead("gemini/some-future-model") is True
+    # Empty/None safe
+    registry.mark_dead("")
+    assert registry.is_dead("") is False
+
+
+def test_registry_mark_dead_with_explicit_cause():
+    """mark_dead accepts an optional cause; registry_store enforces TTL
+    per CAUSE_POLICY (404_transient → 5min, 404_permanent → 24h, auth →
+    no expiry)."""
+    from fatih_hoca.registry import ModelRegistry
+    from fatih_hoca import registry_store
+    registry = ModelRegistry()
+    registry.mark_dead("openrouter/foo", cause="404_transient")
+    assert registry.is_dead("openrouter/foo") is True
+    assert registry_store.get_model_cause("openrouter/foo") == "404_transient"
+
+
+def test_registry_provider_dead_eligibility():
+    """Provider-level mark replaces the legacy per-model mass-mark loop —
+    one row, selector excludes every model on the provider via
+    is_provider_dead. cause='auth' has no TTL."""
+    from fatih_hoca.registry import ModelRegistry
+    registry = ModelRegistry()
+    assert registry.is_provider_dead("openrouter") is False
+    registry.mark_provider_dead("openrouter", cause="auth")
+    assert registry.is_provider_dead("openrouter") is True
+    registry.revive_provider("openrouter", actor="user")
+    assert registry.is_provider_dead("openrouter") is False
+
+
+def test_registry_mark_dead_ttl_expires(monkeypatch):
+    """TTL-driven auto-revive: 404_transient (5min TTL) lets a model
+    self-heal without operator action."""
+    from fatih_hoca.registry import ModelRegistry
+    from fatih_hoca import registry_store
+    import time as _t
+
+    registry = ModelRegistry()
+    registry.mark_dead("openrouter/x", cause="404_transient")
+    assert registry.is_dead("openrouter/x") is True
+
+    # Fast-forward time past the 5min TTL via the same _freeze_time
+    # technique used in tests/infra/test_registry_store.py.
+    fake_epoch = _t.time() + 600
+    iso = _t.strftime("%Y-%m-%d %H:%M:%S", _t.gmtime(fake_epoch))
+    monkeypatch.setattr(registry_store, "_now_iso", lambda: iso)
+    monkeypatch.setattr(registry_store.time, "time", lambda: fake_epoch)
+    assert registry.is_dead("openrouter/x") is False

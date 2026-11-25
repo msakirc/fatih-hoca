@@ -1,0 +1,1666 @@
+"""Scenario factories for Phase 2d simulator.
+
+Each scenario returns a `Scenario` with: `tasks`, `initial_state`,
+`snapshot_factory`, `select_fn`. Wire through the real fatih_hoca.select() in
+`select_fn` via `selector.select_for_simulation()` (implemented in Task 12).
+
+Keep scenarios focused on the state + demand profile; shared helpers
+`_build_select_fn` and `_build_snapshot_factory` translate SimState into
+the shapes the selector expects.
+
+Pool-pressure scenarios (Task 28) live in ``POOL_PRESSURE_SCENARIOS`` at the
+bottom of this file.  Scenarios 1-7 assert pressure values directly
+(pressure-only); scenario 8 is a full admission-flow acceptance gate.
+"""
+from __future__ import annotations
+
+import random
+import time as _time
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from sim.runner import SimTask
+from sim.state import (
+    SimLocalModel,
+    SimPoolCounter,
+    SimState,
+)
+
+
+RNG = random.Random(42)
+
+
+@dataclass
+class Scenario:
+    name: str
+    tasks: list[SimTask]
+    initial_state: SimState
+    snapshot_factory: Callable[[SimState], Any]
+    select_fn: Callable[[SimState, SimTask], Any]
+
+
+def _standard_i2p_task_mix(count: int = 182, seed: int = 42) -> list[SimTask]:
+    """Approximate i2p v3's task-difficulty distribution.
+
+    Roughly 50% d<=3, 30% d=4-6, 15% d=7-8, 5% d=9-10.
+    Uses a fixed-seed RNG for determinism.
+    """
+    rng = random.Random(seed)
+    tasks = []
+    for i in range(count):
+        r = rng.random()
+        if r < 0.50:
+            d = rng.choice([1, 2, 3])
+        elif r < 0.80:
+            d = rng.choice([4, 5, 6])
+        elif r < 0.95:
+            d = rng.choice([7, 8])
+        else:
+            d = rng.choice([9, 10])
+        est_out = 1000 if d <= 5 else (2500 if d <= 7 else 5000)
+        tasks.append(SimTask(idx=i, difficulty=d, estimated_output_tokens=est_out))
+    return tasks
+
+
+def _build_snapshot_factory(scenario_providers: dict[str, Any], wall_anchor: float | None = None):
+    """Builds a closure that turns SimState -> SystemSnapshot-like object.
+
+    Uses real nerd_herd types so `snapshot.pressure_for(model)` is available
+    to the scarcity layer (supply side relocated to nerd_herd).
+    """
+    import time as _time
+
+    from nerd_herd.types import (
+        CloudModelState,
+        CloudProviderState,
+        LocalModelState,
+        RateLimit,
+        RateLimitMatrix,
+        SystemSnapshot,
+    )
+
+    # Pin a wall-clock anchor so virtual-clock -> wall-clock mapping is stable
+    # within a sim run. We project `counter.reset_at` (virtual seconds) onto the
+    # same wall clock for rate-limit reset time calculations.
+    if wall_anchor is None:
+        wall_anchor = _time.time()
+
+    def factory(state: SimState) -> Any:
+        if state.locals:
+            loaded_name = next(
+                (n for n, l in state.locals.items() if l.is_loaded), ""
+            )
+            loaded = state.locals.get(loaded_name)
+            local_snap = LocalModelState(
+                model_name=loaded_name,
+                idle_seconds=loaded.idle_seconds if loaded else 0.0,
+                measured_tps=loaded.tokens_per_second if loaded else 0.0,
+                thinking_enabled=False,
+            )
+        else:
+            local_snap = LocalModelState(
+                model_name=None, idle_seconds=0.0, measured_tps=0.0,
+                thinking_enabled=False,
+            )
+
+        cloud: dict[str, CloudProviderState] = {}
+        for provider, prov_cfg in scenario_providers.items():
+            models: dict[str, CloudModelState] = {}
+            for model_id, _model_cfg in prov_cfg.get("models", {}).items():
+                if prov_cfg.get("is_free"):
+                    counter = state.time_bucketed.get(model_id)
+                else:
+                    counter = state.per_call.get(model_id)
+                if counter is None:
+                    models[model_id] = CloudModelState(
+                        model_id=model_id,
+                        utilization_pct=0.0,
+                        limits=RateLimitMatrix(),
+                    )
+                    continue
+                rpd = RateLimit(
+                    limit=counter.limit,
+                    remaining=counter.remaining,
+                    reset_at=int(wall_anchor + counter.reset_at),
+                )
+                util = 100.0 * (1.0 - counter.remaining / max(1, counter.limit))
+                models[model_id] = CloudModelState(
+                    model_id=model_id,
+                    utilization_pct=util,
+                    limits=RateLimitMatrix(rpd=rpd),
+                )
+            cloud[provider] = CloudProviderState(
+                provider=provider,
+                utilization_pct=0.0,
+                consecutive_failures=0,
+                limits=RateLimitMatrix(),
+                models=models,
+            )
+        return SystemSnapshot(local=local_snap, cloud=cloud)
+
+    return factory
+
+
+def _build_select_fn(scenario_providers: dict[str, Any], tasks: list[SimTask] | None = None):
+    """Wires through the real fatih_hoca.select() against the SimState.
+
+    Owns a single ``wall_anchor`` and a per-run ``BurnLog`` so the burn-rate
+    window (S7) and reset-proximity (S9) share one clock: ``now = wall_anchor
+    + state.virtual_clock``. Each pick is recorded into the burn log so the
+    NEXT tick's S7 sees a real rolling rate.
+    """
+    from types import SimpleNamespace
+    from fatih_hoca import selector as _selector
+    from fatih_hoca.requirements import QueueProfile
+    from nerd_herd.burn_log import BurnLog
+
+    wall_anchor = _time.time()
+    burn_log = BurnLog(window_secs=300.0)
+    snapshot_factory = _build_snapshot_factory(scenario_providers, wall_anchor=wall_anchor)
+
+    # task_name → required capability (only names that imply a hard capability;
+    # everything else implies none, so S6 stays 0 on generic workloads).
+    _CAP_BY_TASK = {"visual_reviewer": "vision"}
+
+    def select(state: SimState, task: SimTask) -> Any:
+        now = wall_anchor + state.virtual_clock
+        queue_profile = None
+        if tasks is not None:
+            remaining = tasks[task.idx:]
+            total = len(remaining)
+            hard = sum(1 for t in remaining if t.difficulty >= 7)
+            by_difficulty: dict[int, int] = {}
+            by_capability: dict[str, int] = {}
+            for t in remaining:
+                by_difficulty[t.difficulty] = by_difficulty.get(t.difficulty, 0) + 1
+                cap = _CAP_BY_TASK.get(t.task_name)
+                if cap:
+                    by_capability[cap] = by_capability.get(cap, 0) + 1
+            queue_profile = QueueProfile(
+                total_ready_count=total,
+                hard_tasks_count=hard,
+                by_difficulty=by_difficulty,
+                by_capability=by_capability,
+            )
+
+        picked = _selector.select_for_simulation(
+            task_name=task.task_name,
+            difficulty=task.difficulty,
+            estimated_output_tokens=task.estimated_output_tokens,
+            snapshot=snapshot_factory(state),
+            providers_cfg=scenario_providers,
+            queue_profile=queue_profile,
+            now=now,
+            burn_log=burn_log,
+        )
+        # Record this pick's consumption so the next tick's S7 sees it.
+        if picked.pool in ("time_bucketed", "per_call") and picked.provider:
+            burn_log.record(
+                provider=picked.provider,
+                model=picked.model_name,
+                tokens=task.estimated_output_tokens,
+                calls=1,
+                now=now,
+            )
+        return SimpleNamespace(
+            model_name=picked.model_name,
+            pool=picked.pool,
+            cap_score_100=picked.cap_score_100,
+            estimated_output_tokens=task.estimated_output_tokens,
+            tokens_per_second=picked.tokens_per_second,
+        )
+
+    return select
+
+
+# -- Scenario factories -------------------------------------------------------
+
+def baseline() -> Scenario:
+    providers = {
+        "groq": {
+            "is_free": True,
+            "models": {"groq/llama-3.1-70b": {"cap_score_100": 72}},
+        },
+        "anthropic": {
+            "is_free": False,
+            "models": {"anthropic/claude-sonnet": {"cap_score_100": 93}},
+        },
+    }
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(is_loaded=True, idle_seconds=300.0, tokens_per_second=20.0)
+    state.time_bucketed["groq/llama-3.1-70b"] = SimPoolCounter(remaining=1000, limit=1000, reset_at=86400.0)
+    state.per_call["anthropic/claude-sonnet"] = SimPoolCounter(remaining=1000, limit=1000, reset_at=86400.0)
+    tasks = _standard_i2p_task_mix()
+    return Scenario(
+        name="baseline",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def claude_constrained() -> Scenario:
+    providers = {
+        "anthropic": {
+            "is_free": False,
+            "models": {"anthropic/claude-sonnet": {"cap_score_100": 93}},
+        },
+        "groq": {
+            "is_free": True,
+            "models": {"groq/llama-3.1-70b": {"cap_score_100": 72}},
+        },
+    }
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(is_loaded=True, idle_seconds=300.0)
+    # Limit sized above the scenario's hard-task count (~47 d≥7 in the
+    # standard 182-task mix) so the "constrained" test exercises scarcity
+    # depletion behavior without being structurally impossible — a pool
+    # smaller than hard demand can never reach 90% hard_task_satisfaction
+    # no matter how well the equation balances.
+    state.per_call["anthropic/claude-sonnet"] = SimPoolCounter(remaining=60, limit=60, reset_at=86400.0)
+    state.time_bucketed["groq/llama-3.1-70b"] = SimPoolCounter(remaining=1000, limit=1000, reset_at=86400.0)
+    tasks = _standard_i2p_task_mix()
+    return Scenario(
+        name="claude_constrained",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def groq_near_reset() -> Scenario:
+    providers = {
+        "groq": {"is_free": True, "models": {"groq/llama-3.1-70b": {"cap_score_100": 72}}},
+        "anthropic": {"is_free": False, "models": {"anthropic/claude-sonnet": {"cap_score_100": 93}}},
+    }
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(is_loaded=True, idle_seconds=300.0)
+    state.time_bucketed["groq/llama-3.1-70b"] = SimPoolCounter(remaining=850, limit=1000, reset_at=1800.0)
+    state.per_call["anthropic/claude-sonnet"] = SimPoolCounter(remaining=1000, limit=1000, reset_at=86400.0)
+    tasks = _standard_i2p_task_mix()
+    return Scenario(
+        name="groq_near_reset",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def diverse_pool() -> Scenario:
+    providers = {
+        "groq": {"is_free": True, "models": {"groq/llama-3.1-70b": {"cap_score_100": 72}}},
+        "gemini": {"is_free": True, "models": {"gemini/gemini-1.5-flash": {"cap_score_100": 68}}},
+        "openrouter": {"is_free": True, "models": {"openrouter/free-mistral": {"cap_score_100": 70}}},
+        "anthropic": {"is_free": False, "models": {"anthropic/claude-sonnet": {"cap_score_100": 93}}},
+    }
+    # Scenario intent: one workflow (~182 tasks) should consume a meaningful
+    # fraction of each free pool's daily budget. Realistic per-workflow limits
+    # (~100-150) scale the 70% utilization target to what's reachable in 182
+    # tasks. Per-day limits (1000+) assume many workflows/day — not modeled here.
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(is_loaded=True, idle_seconds=300.0)
+    # Staggered reset times — realistic diverse state, not all-fresh. Groq
+    # mid-cycle (6h to reset), gemini closer (3h), openrouter near reset
+    # (1.5h). This exercises "waste avoidance" — pools approaching reset
+    # with unused quota should get consumed, not discarded.
+    state.time_bucketed["groq/llama-3.1-70b"] = SimPoolCounter(remaining=15, limit=15, reset_at=21600.0)
+    state.time_bucketed["gemini/gemini-1.5-flash"] = SimPoolCounter(remaining=10, limit=10, reset_at=10800.0)
+    state.time_bucketed["openrouter/free-mistral"] = SimPoolCounter(remaining=8, limit=8, reset_at=5400.0)
+    state.per_call["anthropic/claude-sonnet"] = SimPoolCounter(remaining=1000, limit=1000, reset_at=86400.0)
+    tasks = _standard_i2p_task_mix()
+    return Scenario(
+        name="diverse_pool",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def exhaustion_sequence() -> Scenario:
+    providers = {
+        "groq": {"is_free": True, "models": {"groq/llama-3.1-70b": {"cap_score_100": 72}}},
+        "gemini": {"is_free": True, "models": {"gemini/gemini-1.5-flash": {"cap_score_100": 68}}},
+        "anthropic": {"is_free": False, "models": {"anthropic/claude-sonnet": {"cap_score_100": 93}}},
+    }
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(is_loaded=True, idle_seconds=300.0)
+    state.time_bucketed["groq/llama-3.1-70b"] = SimPoolCounter(remaining=40, limit=40, reset_at=86400.0)
+    state.time_bucketed["gemini/gemini-1.5-flash"] = SimPoolCounter(remaining=40, limit=40, reset_at=86400.0)
+    state.per_call["anthropic/claude-sonnet"] = SimPoolCounter(remaining=1000, limit=1000, reset_at=86400.0)
+    tasks = _standard_i2p_task_mix(count=182)
+    return Scenario(
+        name="exhaustion_sequence",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def back_to_back_i2p() -> Scenario:
+    providers_cfg = {
+        "groq": {"is_free": True, "models": {"groq/llama-3.1-70b": {"cap_score_100": 72}}},
+        "anthropic": {"is_free": False, "models": {"anthropic/claude-sonnet": {"cap_score_100": 93}}},
+    }
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(is_loaded=True, idle_seconds=300.0)
+    state.time_bucketed["groq/llama-3.1-70b"] = SimPoolCounter(remaining=1500, limit=1500, reset_at=86400.0)
+    state.per_call["anthropic/claude-sonnet"] = SimPoolCounter(remaining=1000, limit=1000, reset_at=86400.0)
+    tasks: list[SimTask] = []
+    for seed in (42, 43, 44):
+        batch = _standard_i2p_task_mix(count=182, seed=seed)
+        for t in batch:
+            tasks.append(SimTask(
+                idx=len(tasks), difficulty=t.difficulty,
+                estimated_output_tokens=t.estimated_output_tokens,
+            ))
+    return Scenario(
+        name="back_to_back_i2p",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers_cfg),
+        select_fn=_build_select_fn(providers_cfg, tasks=tasks),
+    )
+
+
+def staggered_i2p() -> Scenario:
+    providers_cfg = {
+        "groq": {"is_free": True, "models": {"groq/llama-3.1-70b": {"cap_score_100": 72}}},
+        "anthropic": {"is_free": False, "models": {"anthropic/claude-sonnet": {"cap_score_100": 93}}},
+    }
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(is_loaded=True, idle_seconds=300.0)
+    state.time_bucketed["groq/llama-3.1-70b"] = SimPoolCounter(remaining=1000, limit=1000, reset_at=86400.0)
+    state.per_call["anthropic/claude-sonnet"] = SimPoolCounter(remaining=1000, limit=1000, reset_at=86400.0)
+
+    first = _standard_i2p_task_mix(count=91, seed=100)
+    second = _standard_i2p_task_mix(count=182, seed=101)
+    tasks: list[SimTask] = []
+    for t in first + second:
+        tasks.append(SimTask(
+            idx=len(tasks), difficulty=t.difficulty,
+            estimated_output_tokens=t.estimated_output_tokens,
+        ))
+    return Scenario(
+        name="staggered_i2p",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers_cfg),
+        select_fn=_build_select_fn(providers_cfg, tasks=tasks),
+    )
+
+
+# ── Pool-pressure scenarios (Task 28) ────────────────────────────────────────
+#
+# These 8 scenarios validate the multi-signal pressure system introduced in the
+# pool-pressure rebuild.  Scenarios 1-7 work at the pressure level
+# (``snapshot.pressure_for()``), asserting signal and scalar values directly
+# without running full admission cycles — the framework is pressure-only, so
+# they store minimal tasks/state and carry assertion helpers alongside the
+# standard Scenario fields.
+#
+# Scenario 8 is the *merge-acceptance gate*: it runs a full 30-task mission via
+# ``run_simulation`` and checks four equilibrium invariants.
+
+
+def _pressure_snapshot(
+    *,
+    local_name: str | None = None,
+    local_idle: float = 0.0,
+    local_tps: float = 20.0,
+    vram_avail_mb: int = 0,
+    cloud_models: dict | None = None,
+) -> Any:
+    """Build a SystemSnapshot directly from nerd_herd types for pressure-only tests."""
+    from nerd_herd.types import (
+        CloudModelState,
+        CloudProviderState,
+        LocalModelState,
+        RateLimitMatrix,
+        SystemSnapshot,
+    )
+
+    local = LocalModelState(
+        model_name=local_name,
+        idle_seconds=local_idle,
+        measured_tps=local_tps,
+        thinking_enabled=False,
+    )
+    cloud: dict[str, CloudProviderState] = {}
+    for provider, models_cfg in (cloud_models or {}).items():
+        model_states: dict[str, CloudModelState] = {}
+        for model_id, limits_matrix in models_cfg.items():
+            util = 0.0
+            if limits_matrix.rpd.limit:
+                util = 100.0 * (1.0 - (limits_matrix.rpd.remaining or 0) / limits_matrix.rpd.limit)
+            model_states[model_id] = CloudModelState(
+                model_id=model_id,
+                utilization_pct=util,
+                limits=limits_matrix,
+            )
+        cloud[provider] = CloudProviderState(
+            provider=provider,
+            utilization_pct=0.0,
+            consecutive_failures=0,
+            limits=RateLimitMatrix(),
+            models=model_states,
+        )
+    return SystemSnapshot(
+        local=local,
+        vram_available_mb=vram_avail_mb,
+        cloud=cloud,
+    )
+
+
+def _cloud_model_stub(
+    *,
+    name: str,
+    provider: str,
+    is_free: bool = False,
+    cap_score: float = 5.0,
+    capabilities: set | None = None,
+    rpd_remaining: int = 100,
+) -> Any:
+    """Minimal SimpleNamespace model stub for pressure-only tests."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        name=name,
+        provider=provider,
+        is_local=False,
+        is_loaded=False,
+        is_free=is_free,
+        cap_score=cap_score,
+        capabilities=capabilities or set(),
+        rpd_remaining=rpd_remaining,
+    )
+
+
+def _local_model_stub(
+    *,
+    name: str = "local-model",
+    is_loaded: bool = False,
+    size_mb: int = 4000,
+    cap_score: float = 5.5,
+) -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        name=name,
+        provider="local",
+        is_local=True,
+        is_loaded=is_loaded,
+        is_free=False,
+        cap_score=cap_score,
+        size_mb=size_mb,
+        capabilities=set(),
+    )
+
+
+# ── Scenario PP1: Fat vs Tiny pool, same % utilisation ───────────────────────
+
+def pp1_fat_vs_tiny() -> Scenario:
+    """Two free-cloud providers at 50% remaining but very different limits.
+
+    After simulated depletion to 10% remaining (same fraction), M1 must amplify
+    tiny pool's negative pressure more strongly than the large pool's.
+
+    Assertion (pressure-only):
+        tiny_scalar < large_scalar  (tiny pool more negative after depletion)
+        |tiny_scalar| > |large_scalar| * 1.1
+    """
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+
+    now = _time.time()
+    reset_at = int(now + 86400)
+
+    # State at 10% remaining — same fraction, different absolute limits
+    tiny_rl = RateLimit(limit=10, remaining=1, reset_at=reset_at)
+    large_rl = RateLimit(limit=1000, remaining=100, reset_at=reset_at)
+
+    state = SimState()
+    state.time_bucketed["tiny/model"] = SimPoolCounter(remaining=1, limit=10, reset_at=86400.0)
+    state.time_bucketed["large/model"] = SimPoolCounter(remaining=100, limit=1000, reset_at=86400.0)
+
+    providers = {
+        "tiny_prov": {"is_free": True, "models": {"tiny/model": {"cap_score_100": 72}}},
+        "large_prov": {"is_free": True, "models": {"large/model": {"cap_score_100": 72}}},
+    }
+    tasks = [SimTask(idx=i, difficulty=5, estimated_output_tokens=1000) for i in range(5)]
+    return Scenario(
+        name="pp1_fat_vs_tiny",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def assert_pp1(scenario: "Scenario") -> list[str]:
+    """Run pressure assertions for PP1. Returns list of failure messages (empty = PASS)."""
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+
+    now = _time.time()
+    reset_at = int(now + 86400)
+
+    tiny_rl = RateLimit(limit=10, remaining=1, reset_at=reset_at)
+    large_rl = RateLimit(limit=1000, remaining=100, reset_at=reset_at)
+
+    snap = _pressure_snapshot(
+        cloud_models={
+            "tiny_prov": {"tiny/model": RateLimitMatrix(rpd=tiny_rl)},
+            "large_prov": {"large/model": RateLimitMatrix(rpd=large_rl)},
+        }
+    )
+    tiny_m = _cloud_model_stub(name="tiny/model", provider="tiny_prov", is_free=True, rpd_remaining=1)
+    large_m = _cloud_model_stub(name="large/model", provider="large_prov", is_free=True, rpd_remaining=100)
+
+    tiny_bd = snap.pressure_for(tiny_m, task_difficulty=5)
+    large_bd = snap.pressure_for(large_m, task_difficulty=5)
+
+    failures = []
+    if not (tiny_bd.scalar < large_bd.scalar):
+        failures.append(
+            f"PP1: tiny scalar ({tiny_bd.scalar:.3f}) >= large scalar ({large_bd.scalar:.3f})"
+        )
+    if not (abs(tiny_bd.scalar) > abs(large_bd.scalar) * 1.1):
+        failures.append(
+            f"PP1: |tiny| ({abs(tiny_bd.scalar):.3f}) not > |large| ({abs(large_bd.scalar):.3f}) * 1.1"
+        )
+    # M1 must be larger for tiny pool
+    if not (tiny_bd.modifiers.get("M1", 1.0) > large_bd.modifiers.get("M1", 1.0)):
+        failures.append(
+            f"PP1: tiny M1 ({tiny_bd.modifiers.get('M1')}) not > large M1 ({large_bd.modifiers.get('M1')})"
+        )
+    return failures
+
+
+# ── Scenario PP2: Token-aware exclusion ──────────────────────────────────────
+
+def pp2_token_exclusion() -> Scenario:
+    """Model with TPM=25k remaining; task needs 30k tokens.
+
+    S2 must fire negative (call-burden pressure), producing scalar < 0.
+    """
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+
+    now = _time.time()
+    tpm_rl = RateLimit(limit=100_000, remaining=25_000, reset_at=int(now + 3600))
+
+    state = SimState()
+    state.per_call["cloud/model"] = SimPoolCounter(remaining=500, limit=1000, reset_at=86400.0)
+
+    providers = {
+        "cloud_prov": {"is_free": False, "models": {"cloud/model": {"cap_score_100": 80}}},
+    }
+    tasks = [SimTask(idx=i, difficulty=5, estimated_output_tokens=30_000) for i in range(5)]
+    return Scenario(
+        name="pp2_token_exclusion",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def assert_pp2(scenario: "Scenario") -> list[str]:
+    """Pressure-only assertion for PP2."""
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+
+    now = _time.time()
+    tpm_rl = RateLimit(limit=100_000, remaining=25_000, reset_at=int(now + 3600))
+    rpd_rl = RateLimit(limit=1000, remaining=500, reset_at=int(now + 86400))
+
+    snap = _pressure_snapshot(
+        cloud_models={
+            "cloud_prov": {
+                "cloud/model": RateLimitMatrix(tpm=tpm_rl, rpd=rpd_rl),
+            }
+        }
+    )
+    cloud_m = _cloud_model_stub(
+        name="cloud/model", provider="cloud_prov", is_free=False,
+        cap_score=8.0, rpd_remaining=500,
+    )
+
+    # est_per_call_tokens > TPM remaining — S2 must fire
+    bd = snap.pressure_for(cloud_m, task_difficulty=5, est_per_call_tokens=30_000)
+
+    failures = []
+    if not (bd.signals.get("S2", 0) < 0):
+        failures.append(f"PP2: S2 ({bd.signals.get('S2')}) should be negative when tokens > remaining")
+    if not (bd.scalar < 0):
+        failures.append(f"PP2: scalar ({bd.scalar:.3f}) should be < 0 for token-exceeding task")
+    return failures
+
+
+# ── Scenario PP3: Cold local + free VRAM → admits default-urgency ─────────────
+
+def pp3_cold_local_vram() -> Scenario:
+    """Cold local model, VRAM >= size_mb.  S9 must return COLD_LOCAL_VRAM_OK (0.4)."""
+    state = SimState()
+    # No loaded locals; local model not yet loaded
+    providers: dict[str, Any] = {}
+    tasks = [SimTask(idx=0, difficulty=5, estimated_output_tokens=1000)]
+    return Scenario(
+        name="pp3_cold_local_vram",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def assert_pp3(scenario: "Scenario") -> list[str]:
+    """Pressure-only assertion for PP3."""
+    from nerd_herd.types import LocalModelState, RateLimitMatrix
+
+    local_state = LocalModelState(
+        model_name=None, idle_seconds=0.0, measured_tps=0.0, thinking_enabled=False,
+    )
+    local_m = _local_model_stub(name="cold-local", is_loaded=False, size_mb=4000)
+
+    snap = _pressure_snapshot(local_name=None, local_idle=0.0, vram_avail_mb=8000)
+
+    # S9 directly
+    from nerd_herd.signals.s9_perishability import s9_perishability
+    s9_val = s9_perishability(
+        local_m, local=local_state, vram_avail_mb=8000,
+        matrix=RateLimitMatrix(), task_difficulty=5,
+    )
+
+    # Full pressure
+    bd = snap.pressure_for(local_m, task_difficulty=5)
+
+    failures = []
+    if abs(s9_val - 0.4) > 0.01:
+        failures.append(f"PP3: S9 ({s9_val:.3f}) expected 0.4 (COLD_LOCAL_VRAM_OK)")
+    if bd.scalar < 0:
+        failures.append(f"PP3: pressure scalar ({bd.scalar:.3f}) should be >= 0 for cold local with VRAM")
+    return failures
+
+
+# ── Scenario PP4: Free cloud near reset + flush quota ─────────────────────────
+
+def pp4_free_cloud_near_reset() -> Scenario:
+    """Free cloud model: 95% remaining, reset in 600s.  S9 must be > 0.7."""
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+
+    now = _time.time()
+    rpd_rl = RateLimit(limit=1000, remaining=950, reset_at=int(now + 600))
+    state = SimState()
+    state.time_bucketed["free/model"] = SimPoolCounter(remaining=950, limit=1000, reset_at=600.0)
+
+    providers = {
+        "free_prov": {"is_free": True, "models": {"free/model": {"cap_score_100": 72}}},
+    }
+    tasks = [SimTask(idx=i, difficulty=3, estimated_output_tokens=1000) for i in range(5)]
+    return Scenario(
+        name="pp4_free_cloud_near_reset",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def assert_pp4(scenario: "Scenario") -> list[str]:
+    """Pressure-only assertion for PP4."""
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+    from nerd_herd.signals.s9_perishability import s9_perishability
+
+    now = _time.time()
+    rpd_rl = RateLimit(limit=1000, remaining=950, reset_at=int(now + 600))
+    free_m = _cloud_model_stub(name="free/model", provider="free_prov", is_free=True, rpd_remaining=950)
+
+    s9_val = s9_perishability(
+        free_m, local=None, vram_avail_mb=0, matrix=RateLimitMatrix(rpd=rpd_rl), task_difficulty=3,
+    )
+
+    snap = _pressure_snapshot(
+        cloud_models={"free_prov": {"free/model": RateLimitMatrix(rpd=rpd_rl)}}
+    )
+    bd = snap.pressure_for(free_m, task_difficulty=3)
+
+    failures = []
+    if s9_val <= 0.7:
+        failures.append(f"PP4: S9 ({s9_val:.3f}) should be > 0.7 for free cloud near reset with 95% remaining")
+    if bd.scalar <= 0:
+        failures.append(f"PP4: pressure scalar ({bd.scalar:.3f}) should be > 0; free cloud should admit")
+    return failures
+
+
+# ── Scenario PP5: Paid cloud flush + no hard queue ─────────────────────────────
+
+def pp5_paid_flush_no_hard_queue() -> Scenario:
+    """Paid cloud model at 95% remaining, easy task d=3.
+
+    S9 for paid+easy = 0; pressure not strongly positive; if a local exists
+    with VRAM it should win.
+    """
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+
+    now = _time.time()
+    rpd_rl = RateLimit(limit=100, remaining=95, reset_at=int(now + 600))
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(is_loaded=True, idle_seconds=300.0, tokens_per_second=20.0)
+    state.per_call["paid/claude"] = SimPoolCounter(remaining=95, limit=100, reset_at=600.0)
+
+    providers = {
+        "paid_prov": {"is_free": False, "models": {"paid/claude": {"cap_score_100": 93}}},
+    }
+    tasks = [SimTask(idx=i, difficulty=3, estimated_output_tokens=1000) for i in range(10)]
+    return Scenario(
+        name="pp5_paid_flush_no_hard_queue",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def assert_pp5(scenario: "Scenario") -> list[str]:
+    """Pressure-only assertion for PP5 (S9=0 for paid+easy)."""
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+    from nerd_herd.signals.s9_perishability import s9_perishability
+
+    now = _time.time()
+    rpd_rl = RateLimit(limit=100, remaining=95, reset_at=int(now + 600))
+    paid_m = _cloud_model_stub(name="paid/claude", provider="paid_prov", is_free=False, cap_score=9.3, rpd_remaining=95)
+
+    s9_val = s9_perishability(
+        paid_m, local=None, vram_avail_mb=0, matrix=RateLimitMatrix(rpd=rpd_rl), task_difficulty=3,
+    )
+
+    failures = []
+    if s9_val != 0.0:
+        failures.append(f"PP5: S9 ({s9_val:.3f}) should be 0.0 for paid cloud with easy task (d<7)")
+    return failures
+
+
+def assert_pp5_selection(run: Any) -> list[str]:
+    """Full-sim assertion: local should dominate easy tasks for PP5."""
+    from sim.runner import SimRun
+    from collections import Counter
+
+    if not isinstance(run, SimRun):
+        return ["PP5: no SimRun to check"]
+    local_picks = sum(1 for p in run.picks if p.pool == "local")
+    cloud_picks = sum(1 for p in run.picks if p.pool == "per_call")
+    failures = []
+    if local_picks <= cloud_picks:
+        failures.append(
+            f"PP5: local ({local_picks}) should dominate over paid cloud ({cloud_picks}) for easy tasks"
+        )
+    return failures
+
+
+# ── Scenario PP6: Capability shortage ─────────────────────────────────────────
+
+def pp6_capability_shortage() -> Scenario:
+    """Queue has 50 vision tasks; only one vision-capable model with limited capacity.
+
+    S6 must fire negative conserve-pressure on that model.
+    """
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+
+    now = _time.time()
+    rpd_rl = RateLimit(limit=20, remaining=20, reset_at=int(now + 86400))
+    state = SimState()
+    state.per_call["vision/model"] = SimPoolCounter(remaining=20, limit=20, reset_at=86400.0)
+
+    providers = {
+        "cloud_prov": {"is_free": False, "models": {"vision/model": {"cap_score_100": 85}}},
+    }
+    tasks = [SimTask(idx=i, difficulty=5, task_name="visual_reviewer",
+                     estimated_output_tokens=1000) for i in range(5)]
+    return Scenario(
+        name="pp6_capability_shortage",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def assert_pp6(scenario: "Scenario") -> list[str]:
+    """Pressure-only assertion for PP6."""
+    from nerd_herd.types import QueueProfile
+    from nerd_herd.signals.s6_capable_supply import s6_capable_supply
+    from types import SimpleNamespace
+
+    # Vision model with limited remaining capacity
+    vision_m = SimpleNamespace(
+        name="vision/model", provider="cloud_prov", is_local=False, is_free=False,
+        cap_score=8.5, capabilities={"vision"}, rpd_remaining=20,
+    )
+    # Queue with 50 vision tasks
+    queue = QueueProfile(by_capability={"vision": 50}, hard_tasks_count=0, total_ready_count=50)
+
+    s6_val = s6_capable_supply(vision_m, queue=queue, eligible_models=[vision_m], iter_avg=8.0)
+
+    failures = []
+    if s6_val >= 0:
+        failures.append(
+            f"PP6: S6 ({s6_val:.3f}) should be negative (conserve-pressure) "
+            "when vision demand >> vision supply"
+        )
+    return failures
+
+
+# ── Scenario PP7: Difficulty lookahead ────────────────────────────────────────
+
+def pp7_difficulty_lookahead() -> Scenario:
+    """Queue has 8 d=9 tasks; current candidate is d=3.
+
+    The easy task should not admit to paid cloud — local wins.
+    """
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+
+    now = _time.time()
+    rpd_rl = RateLimit(limit=1000, remaining=500, reset_at=int(now + 86400))
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(is_loaded=True, idle_seconds=300.0, tokens_per_second=20.0)
+    state.per_call["paid_prov/claude"] = SimPoolCounter(remaining=500, limit=1000, reset_at=86400.0)
+
+    providers = {
+        "paid_prov": {"is_free": False, "models": {"paid_prov/claude": {"cap_score_100": 93}}},
+    }
+    # 8 hard tasks first, then 1 easy task
+    hard_tasks = [SimTask(idx=i, difficulty=9, estimated_output_tokens=5000) for i in range(8)]
+    easy_task = SimTask(idx=8, difficulty=3, estimated_output_tokens=1000)
+    tasks = hard_tasks + [easy_task]
+    return Scenario(
+        name="pp7_difficulty_lookahead",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def assert_pp7_m3_weights() -> list[str]:
+    """Pressure-only: M3 must down-weight S9 for paid+easy vs paid+hard."""
+    from nerd_herd.modifiers import M3_difficulty_weights
+
+    w_easy = M3_difficulty_weights(difficulty=3, model_is_paid=True)
+    w_hard = M3_difficulty_weights(difficulty=8, model_is_paid=True)
+
+    failures = []
+    if not (w_easy["S9"] < w_hard["S9"]):
+        failures.append(
+            f"PP7: M3 S9 weight for easy ({w_easy['S9']}) should be < hard ({w_hard['S9']})"
+        )
+    return failures
+
+
+# ── Scenario PP8: Equilibrium full mission (acceptance gate) ──────────────────
+
+def pp8_equilibrium_mission() -> Scenario:
+    """30-task mixed mission: d=3/5/7/9.  This is the merge-acceptance gate.
+
+    Assertions (full admission flow):
+      A: cloud RPD never exhausts (remaining > 0 at end)
+      B: local never idle while free cloud has flush quota AND queue non-empty
+         (tested as: local makes at least 1 pick when a free pool has > 90% remaining)
+      C: no single pool's utilisation exceeds 80% before queue empties
+      D: total admission cycles == number of tasks (1:1, no retries in sim)
+    """
+    rng = random.Random(99)
+    tasks = []
+    for i in range(30):
+        r = rng.random()
+        if r < 0.30:
+            d = 3
+        elif r < 0.60:
+            d = 5
+        elif r < 0.80:
+            d = 7
+        else:
+            d = 9
+        est_out = 1000 if d <= 4 else (2500 if d <= 6 else 5000)
+        tasks.append(SimTask(idx=i, difficulty=d, estimated_output_tokens=est_out))
+
+    providers = {
+        "groq": {"is_free": True, "models": {"groq/llama": {"cap_score_100": 72}}},
+        "anthropic": {"is_free": False, "models": {"anthropic/claude": {"cap_score_100": 93}}},
+    }
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(is_loaded=True, idle_seconds=300.0, tokens_per_second=20.0)
+    # Limits comfortably above 30 tasks each so exhaustion is physically impossible in one run
+    state.time_bucketed["groq/llama"] = SimPoolCounter(remaining=50, limit=50, reset_at=86400.0)
+    state.per_call["anthropic/claude"] = SimPoolCounter(remaining=100, limit=100, reset_at=86400.0)
+    return Scenario(
+        name="pp8_equilibrium_mission",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def assert_pp8(scenario: "Scenario") -> list[str]:
+    """Run full admission flow and check 4 equilibrium invariants."""
+    from sim.runner import run_simulation
+
+    run = run_simulation(
+        tasks=scenario.tasks,
+        initial_state=scenario.initial_state,
+        select_fn=scenario.select_fn,
+        snapshot_factory=scenario.snapshot_factory,
+    )
+
+    failures = []
+
+    # A: Cloud RPD must not exhaust
+    groq_rem = run.final_state.time_bucketed.get("groq/llama")
+    anthropic_rem = run.final_state.per_call.get("anthropic/claude")
+    if groq_rem and groq_rem.remaining <= 0:
+        failures.append(f"PP8-A: groq/llama exhausted (remaining={groq_rem.remaining})")
+    if anthropic_rem and anthropic_rem.remaining <= 0:
+        failures.append(f"PP8-A: anthropic/claude exhausted (remaining={anthropic_rem.remaining})")
+
+    # B: Local must have made at least 1 pick (not idle while work exists)
+    local_picks = sum(1 for p in run.picks if p.pool == "local")
+    if local_picks == 0:
+        failures.append("PP8-B: local made 0 picks; should be active when free quota available")
+
+    # C: No single pool > 80% utilisation
+    if groq_rem:
+        groq_util = 1.0 - groq_rem.remaining / groq_rem.limit
+        if groq_util > 0.80:
+            failures.append(f"PP8-C: groq utilisation {groq_util:.1%} exceeds 80%")
+    if anthropic_rem:
+        anthropic_util = 1.0 - anthropic_rem.remaining / anthropic_rem.limit
+        if anthropic_util > 0.80:
+            failures.append(f"PP8-C: anthropic utilisation {anthropic_util:.1%} exceeds 80%")
+
+    # D: Admission cycles == number of tasks (1:1)
+    if len(run.picks) != len(scenario.tasks):
+        failures.append(
+            f"PP8-D: picks ({len(run.picks)}) != tasks ({len(scenario.tasks)})"
+        )
+
+    return failures
+
+
+# ── Realistic-Pool (RP) scenarios ─────────────────────────────────────────────
+# Mirrors actual production state observed 2026-04-30 after the discovery
+# + quota-seed + property-fallback fixes. Pools are tier-realistic, not
+# the round numbers used by PP1-PP8.
+#
+# Production reality reflected here:
+#   gemini free tier:    gemini-3-flash-preview = 5 RPM / 250K TPM / 20 RPD
+#                        gemini-2.5-flash      = 5 RPM / 250K TPM / 20 RPD
+#   groq free tier:      compound-mini = 30 RPM / 6K TPM / 14400 RPD
+#                        gpt-oss-120b  = 30 RPM / 6K TPM / 1000 RPD
+#   anthropic paid:      claude-sonnet = 50 RPM / 80K TPM / 1000 RPD
+#   openrouter paid:     varies (treat as cap=15 RPM)
+#   local:               loaded Qwen3.5-9B, idle 300s
+#
+# Each scenario tests one realistic constraint pattern.
+
+
+def _realistic_providers() -> dict:
+    """Provider config that matches production keys + tiers post-fix.
+
+    OpenRouter modelled with two representatives:
+      openrouter/anthropic/claude-sonnet-4.6 — paid premium, cap=88
+      openrouter/qwen/qwen3-coder              — paid mid, cap=72
+    """
+    return {
+        "gemini": {
+            "is_free": True,
+            "models": {
+                "gemini/gemini-3-flash-preview": {"cap_score_100": 75},
+                "gemini/gemini-2.5-flash": {"cap_score_100": 70},
+            },
+        },
+        "groq": {
+            "is_free": True,
+            "models": {
+                "groq/compound-mini": {"cap_score_100": 65},
+                "groq/openai/gpt-oss-120b": {"cap_score_100": 78},
+            },
+        },
+        "openrouter": {
+            "is_free": False,
+            "models": {
+                "openrouter/anthropic/claude-sonnet-4.6": {"cap_score_100": 88},
+                "openrouter/qwen/qwen3-coder": {"cap_score_100": 72},
+            },
+        },
+        "anthropic": {
+            "is_free": False,
+            "models": {"anthropic/claude-sonnet-4-6": {"cap_score_100": 90}},
+        },
+    }
+
+
+def _realistic_state(*, gemini_remaining_rpd: int = 20,
+                      groq_remaining_rpd: int = 14_400,
+                      claude_remaining_rpd: int = 1_000,
+                      openrouter_remaining_rpd: int = 1_000) -> SimState:
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(
+        is_loaded=True, idle_seconds=300.0, tokens_per_second=15.0,
+    )
+    # Free-cloud time-bucketed counters
+    state.time_bucketed["gemini/gemini-3-flash-preview"] = SimPoolCounter(
+        remaining=gemini_remaining_rpd, limit=20, reset_at=86400.0,
+    )
+    state.time_bucketed["gemini/gemini-2.5-flash"] = SimPoolCounter(
+        remaining=gemini_remaining_rpd, limit=20, reset_at=86400.0,
+    )
+    state.time_bucketed["groq/compound-mini"] = SimPoolCounter(
+        remaining=groq_remaining_rpd, limit=14_400, reset_at=86400.0,
+    )
+    state.time_bucketed["groq/openai/gpt-oss-120b"] = SimPoolCounter(
+        remaining=min(groq_remaining_rpd, 1000), limit=1000, reset_at=86400.0,
+    )
+    # Paid per-call counters
+    state.per_call["anthropic/claude-sonnet-4-6"] = SimPoolCounter(
+        remaining=claude_remaining_rpd, limit=1000, reset_at=86400.0,
+    )
+    state.per_call["openrouter/anthropic/claude-sonnet-4.6"] = SimPoolCounter(
+        remaining=openrouter_remaining_rpd, limit=1000, reset_at=86400.0,
+    )
+    state.per_call["openrouter/qwen/qwen3-coder"] = SimPoolCounter(
+        remaining=openrouter_remaining_rpd, limit=1000, reset_at=86400.0,
+    )
+    return state
+
+
+def rp1_realistic_baseline() -> Scenario:
+    """Production state with full quotas. Distribution should:
+       - lean local for easy/medium tasks (loaded, fast)
+       - lean groq compound-mini for medium-cloud (free, abundant)
+       - reserve gemini-3-flash for medium-hard (its 20 RPD is precious)
+       - reserve claude-sonnet for d>=8 hard tasks (right-tool perishability)
+    """
+    providers = _realistic_providers()
+    state = _realistic_state()
+    tasks = _standard_i2p_task_mix()
+    return Scenario(
+        name="rp1_realistic_baseline",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def rp2_gemini_rpd_burned() -> Scenario:
+    """Gemini RPD already depleted (1/20 left across both flash models).
+    Selector must shift to groq + local; gemini share should approach 0.
+    Hard tasks still go to claude (paid per_call abundant)."""
+    providers = _realistic_providers()
+    state = _realistic_state(gemini_remaining_rpd=1)
+    tasks = _standard_i2p_task_mix()
+    return Scenario(
+        name="rp2_gemini_rpd_burned",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def rp3_groq_constrained_premium_intelligent() -> Scenario:
+    """Groq + Gemini both deeply depleted. Premium claude is the only
+    cloud option with capacity. M3 difficulty weights should keep
+    claude reserved for hard tasks; easy tasks must fall to local
+    (NOT waste claude on d=3 router calls)."""
+    providers = _realistic_providers()
+    state = _realistic_state(
+        gemini_remaining_rpd=2,
+        groq_remaining_rpd=100,  # <1% of 14400
+    )
+    tasks = _standard_i2p_task_mix()
+    return Scenario(
+        name="rp3_groq_constrained_premium_intelligent",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def rp4_full_cloud_exhaustion() -> Scenario:
+    """Every cloud pool ≤2% remaining. Local should pick up everything
+    that fits its capability; hard tasks beyond local-cap should fall
+    to whichever cloud has even a sliver left (whose S1 abundance is
+    higher). Verifies graceful degradation, not catastrophic failure."""
+    providers = _realistic_providers()
+    state = _realistic_state(
+        gemini_remaining_rpd=1,
+        groq_remaining_rpd=50,
+        claude_remaining_rpd=20,
+    )
+    tasks = _standard_i2p_task_mix()
+    return Scenario(
+        name="rp4_full_cloud_exhaustion",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+# ── Scenario PP9: Giant tank vs many small idle tanks (S12 anti-monopoly) ─────
+
+def pp9_giant_vs_small_idle_spread() -> Scenario:
+    """One giant-tank free provider + three small-tank idle free providers,
+    all comparable capability, no local. Before the 2026-06-04 fix, scale-
+    invariant frac-abundance let the giant (which stays near frac=1.0) win
+    everything while the small idle quotas rotted. S12 (fleet under-use,
+    absolute-consumption balance) must spread load across ALL four.
+    """
+    # Comparable, high caps so capability doesn't pick a winner — and above
+    # the sim's loaded-local stub (cap 55) so d=6 work goes to free cloud
+    # (local under-qualified), exercising free-vs-free balancing not local.
+    providers = {
+        "giant": {"is_free": True, "models": {"giant/m": {"cap_score_100": 80}}},
+        "small_a": {"is_free": True, "models": {"small_a/m": {"cap_score_100": 80}}},
+        "small_b": {"is_free": True, "models": {"small_b/m": {"cap_score_100": 79}}},
+        "small_c": {"is_free": True, "models": {"small_c/m": {"cap_score_100": 78}}},
+    }
+    state = SimState()
+    state.time_bucketed["giant/m"] = SimPoolCounter(remaining=14_400, limit=14_400, reset_at=86400.0)
+    state.time_bucketed["small_a/m"] = SimPoolCounter(remaining=200, limit=200, reset_at=86400.0)
+    state.time_bucketed["small_b/m"] = SimPoolCounter(remaining=200, limit=200, reset_at=86400.0)
+    state.time_bucketed["small_c/m"] = SimPoolCounter(remaining=200, limit=200, reset_at=86400.0)
+    tasks = [SimTask(idx=i, difficulty=6, estimated_output_tokens=1000) for i in range(120)]
+    return Scenario(
+        name="pp9_giant_vs_small_idle_spread",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def assert_pp9(scenario: "Scenario") -> list[str]:
+    """Pressure-only: S12 must give an UNDER-used free provider more positive
+    pressure than an OVER-used one of identical capability, even though the
+    over-used one is a giant tank still near frac=1.0 (the scale-invariance
+    trap that S1 frac-abundance fell into). Locks the 2026-06-04 anti-monopoly
+    fix at the signal level. (Full-sim spread is shown by rp1 in the realistic
+    distribution table — gemini goes 0 → meaningful share.)
+    """
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+
+    now = _time.time()
+    reset_at = int(now + 86400)
+    # Giant tank, barely dented (frac ≈ 0.99) but has ABSORBED all the work.
+    giant_rl = RateLimit(limit=14_400, remaining=14_300, reset_at=reset_at)
+    # Small tank, fully idle (frac = 1.0), absorbed nothing.
+    small_rl = RateLimit(limit=200, remaining=200, reset_at=reset_at)
+
+    snap = _pressure_snapshot(cloud_models={
+        "giant": {"giant/m": RateLimitMatrix(rpd=giant_rl)},
+        "small": {"small/m": RateLimitMatrix(rpd=small_rl)},
+    })
+    giant_m = _cloud_model_stub(name="giant/m", provider="giant", is_free=True, rpd_remaining=14_300)
+    small_m = _cloud_model_stub(name="small/m", provider="small", is_free=True, rpd_remaining=200)
+
+    # Absolute consumption: giant took 100 calls, small took 0.
+    fleet = {"giant": 100.0, "small": 0.0}
+    g = snap.pressure_for(giant_m, task_difficulty=3, fleet_consumed=fleet)
+    s = snap.pressure_for(small_m, task_difficulty=3, fleet_consumed=fleet)
+
+    failures = []
+    if not (s.scalar > g.scalar):
+        failures.append(
+            f"PP9: idle small ({s.scalar:.3f}) must outpull over-used giant "
+            f"({g.scalar:.3f}) — S12 anti-monopoly"
+        )
+    if s.signals.get("S12", 0.0) <= 0.0:
+        failures.append(f"PP9: S12 for idle small should be > 0, got {s.signals.get('S12')}")
+    if g.signals.get("S12", 0.0) != 0.0:
+        failures.append(f"PP9: S12 for over-used giant should be 0, got {g.signals.get('S12')}")
+    return failures
+
+
+# ── S7 continuity probe — burn-rate signal must be continuous + monotonic ─────
+
+def assert_s7_continuity() -> list[str]:
+    """Sample S7 across rising burn on a small tank: strictly increasing
+    magnitude, no flat-zero region once burn is nonzero, saturating at -1."""
+    import time as _t
+    from nerd_herd.types import (
+        SystemSnapshot, CloudProviderState, CloudModelState,
+        RateLimit, RateLimitMatrix,
+    )
+    from nerd_herd.burn_log import BurnLog
+
+    now = _t.time()
+    rpd = RateLimit(limit=20, remaining=10, reset_at=int(now + 3600))
+    cms = CloudModelState(model_id="gem/flash", utilization_pct=0.0,
+                          limits=RateLimitMatrix(rpd=rpd))
+    snap = SystemSnapshot(cloud={"gem": CloudProviderState(
+        provider="gem", models={"gem/flash": cms})})
+    from types import SimpleNamespace
+    m = SimpleNamespace(name="gem/flash", provider="gem", is_local=False,
+                        is_free=True, cap_score=7.0, capabilities=set(), rpd_remaining=10)
+
+    mags = []
+    for n_calls in (0, 1, 2, 4, 8, 16):
+        bl = BurnLog(window_secs=300.0)
+        for i in range(n_calls):
+            bl.record(provider="gem", model="gem/flash", tokens=500, calls=1, now=now - i)
+        s7 = snap.pressure_for(m, task_difficulty=5, now=now, burn_log=bl).signals["S7"]
+        mags.append(-s7)  # magnitude (S7 <= 0)
+
+    failures = []
+    if mags[0] != 0.0:
+        failures.append(f"S7-cont: zero burn must give 0, got {mags[0]}")
+    if any(b < a - 1e-9 for a, b in zip(mags, mags[1:])):
+        failures.append(f"S7-cont: magnitude not monotonic in burn: {mags}")
+    if not (mags[1] > 0.0):
+        failures.append(f"S7-cont: any nonzero burn must lift S7 off zero, got {mags[1]}")
+    if not (mags[-1] >= mags[1]):
+        failures.append("S7-cont: heavy burn must not be weaker than light burn")
+    return failures
+
+
+# ── S6 capability-conserve — graded conserve-pressure, fed via rollup ─────────
+
+def assert_s6_conserve() -> list[str]:
+    """Vision demand >> vision supply → S6 fires negative and is graded
+    (heavier shortage = stronger), not a single bang-bang step."""
+    from nerd_herd.types import QueueProfile
+    from nerd_herd.signals.s6_capable_supply import s6_capable_supply
+    from types import SimpleNamespace
+
+    vm = SimpleNamespace(name="v/m", provider="p", is_local=False, is_free=False,
+                         cap_score=8.5, capabilities={"vision"}, rpd_remaining=20)
+    light = QueueProfile(by_capability={"vision": 25}, total_ready_count=25)
+    heavy = QueueProfile(by_capability={"vision": 200}, total_ready_count=200)
+    s6_light = s6_capable_supply(vm, queue=light, eligible_models=[vm], iter_avg=8.0)
+    s6_heavy = s6_capable_supply(vm, queue=heavy, eligible_models=[vm], iter_avg=8.0)
+
+    failures = []
+    if not (s6_heavy < 0):
+        failures.append(f"S6: heavy vision shortage must be negative, got {s6_heavy}")
+    if not (s6_heavy <= s6_light):
+        failures.append(f"S6: heavier shortage must be >= magnitude (heavy {s6_heavy} "
+                        f"!<= light {s6_light}) — graded, not bang-bang")
+    return failures
+
+
+# ── rp5: overdraw early-warning — hammer a tank, load must shift before 0 ─────
+
+def rp5_overdraw_early_warning() -> Scenario:
+    """End-to-end fleet-balance + anti-exhaustion + liveness guard under
+    sustained scarce free quota. Two comparable free pools (hot cap 78 / cool
+    cap 77, 45-call tanks) + paid fallback + the always-injected loaded local.
+    100 medium (d=6) tasks. The signals under test (de-blinded S7 burn-rate +
+    S12 fleet-balance) must keep cloud-bound work BALANCED across the two free
+    peers — so neither rides to its 45-cap (exhaustion → the 'no candidates'
+    tail) — while still using free cloud rather than dumping everything on local.
+
+    Note: a pure free-vs-free overdraw isolation isn't achievable in this
+    harness because ``select_for_simulation`` always injects an attractive
+    loaded-local candidate; the S7 de-blinding itself is proven at the unit
+    level (nerd_herd test_s7_continuity). This scenario is the realistic
+    end-to-end regression guard. Measured by PICK COUNTS (reset-proof)."""
+    providers = {
+        "hot": {"is_free": True, "models": {"hot/m": {"cap_score_100": 78}}},
+        "cool": {"is_free": True, "models": {"cool/m": {"cap_score_100": 77}}},
+        "anthropic": {"is_free": False, "models": {"anthropic/claude": {"cap_score_100": 92}}},
+    }
+    state = SimState()
+    state.locals["loaded-local"] = SimLocalModel(is_loaded=True, idle_seconds=300.0, tokens_per_second=15.0)
+    # 45-call tanks: a balanced split lands ~30 each (under cap); a monopoly
+    # would push one pool past 45 (exhaustion). reset_at 2h keeps S9's
+    # use-it-or-lose-it pull alive so free cloud is genuinely exercised.
+    state.time_bucketed["hot/m"] = SimPoolCounter(remaining=45, limit=45, reset_at=7200.0)
+    state.time_bucketed["cool/m"] = SimPoolCounter(remaining=45, limit=45, reset_at=7200.0)
+    state.per_call["anthropic/claude"] = SimPoolCounter(remaining=1000, limit=1000, reset_at=86400.0)
+    tasks = [SimTask(idx=i, difficulty=6, estimated_output_tokens=1500) for i in range(100)]
+    return Scenario(
+        name="rp5_overdraw_early_warning",
+        tasks=tasks,
+        initial_state=state,
+        snapshot_factory=_build_snapshot_factory(providers),
+        select_fn=_build_select_fn(providers, tasks=tasks),
+    )
+
+
+def assert_rp5(scenario: "Scenario") -> list[str]:
+    """Measured by PICK COUNTS (reset-proof). Four properties:
+      (1) liveness — every task got a model (no 'no candidates' deadlock);
+      (2) no free pool ridden to its cap (exhaustion → warm-fallback loss);
+      (3) the two free peers balanced (S12/S7 don't monopolise one pool);
+      (4) free cloud genuinely used (not all work dumped on local)."""
+    from collections import Counter
+    from sim.runner import run_simulation
+    run = run_simulation(
+        tasks=scenario.tasks, initial_state=scenario.initial_state,
+        select_fn=scenario.select_fn, snapshot_factory=scenario.snapshot_factory,
+    )
+    counts = Counter(p.model_name for p in run.picks)
+    hot_picks = counts.get("hot/m", 0)
+    cool_picks = counts.get("cool/m", 0)
+    hot_limit = scenario.initial_state.time_bucketed["hot/m"].limit  # limit never decremented
+
+    failures = []
+    if len(run.picks) != len(scenario.tasks):
+        failures.append(
+            f"rp5: liveness — {len(run.picks)} picks for {len(scenario.tasks)} tasks "
+            "(a task got no model)"
+        )
+    if hot_picks >= hot_limit or cool_picks >= hot_limit:
+        failures.append(
+            f"rp5: a free pool rode to its cap (hot={hot_picks} cool={cool_picks} "
+            f"limit={hot_limit}) — exhaustion instead of early spread"
+        )
+    if min(hot_picks, cool_picks) < 0.5 * max(hot_picks, cool_picks):
+        failures.append(
+            f"rp5: free peers imbalanced (hot={hot_picks} cool={cool_picks}) — "
+            "one free pool monopolised, fleet-balance not holding"
+        )
+    if hot_picks + cool_picks < 30:
+        failures.append(
+            f"rp5: free cloud abandoned (hot+cool={hot_picks + cool_picks} of 100) — "
+            "work dumped on local instead of using available free quota"
+        )
+    return failures
+
+
+def assert_pp10_per_minute_window_does_not_conserve_floor() -> list[str]:
+    """A free model whose ONLY tight axis is PER-MINUTE (rpm/tpm), with a FULL
+    daily quota, must NOT be floored by a deep queue. A per-minute window paces
+    (refills ~60s) — a deep queue drains over minutes and never exhausts it, so
+    queue-CONSERVATION (S4/S5) must not fire on it. Pre-fix this erased the
+    model (composite ×0): the live waste (premium grabbed easy tasks) + the
+    minimal-mode stall (every free floored on its per-minute window). Per-task
+    fit on the minute window stays with S2/S3; per-minute pacing stays with
+    lane caps + in-flight. Asserts the model stays SERVICEABLE (scalar > -0.5)
+    and the queue bucket is ~0.
+    """
+    from nerd_herd.types import QueueProfile, RateLimit, RateLimitMatrix
+
+    now = _time.time()
+    # Small per-minute window (rpm 10 / tpm 30k) mirroring real free tiers, but
+    # FULL daily quota. Small rpm makes M1 amplify (×1.5) — the live floor's
+    # shape — so this proves the EXCLUSION, not a dampened magnitude.
+    matrix = RateLimitMatrix(
+        rpm=RateLimit(limit=10, remaining=10, reset_at=int(now + 60)),
+        tpm=RateLimit(limit=30_000, remaining=30_000, reset_at=int(now + 3600)),
+        rpd=RateLimit(limit=1_000, remaining=1_000, reset_at=int(now + 86400)),
+    )
+    snap = _pressure_snapshot(cloud_models={"free_prov": {"free/model": matrix}})
+    # Deep queue that WOULD saturate the per-minute window (300k >> 30k tpm,
+    # 100 >> 10 rpm) — but those are pacing axes, so it must not conserve-floor.
+    snap.queue_profile = QueueProfile(
+        total_ready_count=20, projected_tokens=300_000, projected_calls=100,
+    )
+    model = _cloud_model_stub(
+        name="free/model", provider="free_prov", is_free=True, rpd_remaining=1_000,
+    )
+    # Small per-task estimate so S2/S3 (per-task fit) don't muddy the queue test.
+    bd = snap.pressure_for(
+        model, task_difficulty=3, est_per_task_tokens=2_000, est_iterations=4,
+    )
+    queue = bd.bucket_totals.get("queue", 0.0)
+    failures = []
+    if not (bd.scalar > -0.5):
+        failures.append(
+            f"pp10: per-minute-only-tight model must stay serviceable, got "
+            f"scalar={bd.scalar:.3f} — a refilling window must not conserve-floor"
+        )
+    if not (queue > -0.3):
+        failures.append(
+            f"pp10: queue bucket must be ~0 (per-minute excluded), got "
+            f"queue={queue:.3f}"
+        )
+    return failures
+
+
+def assert_pp11_daily_overshoot_still_conserves() -> list[str]:
+    """The genuine conservation case S4/S5 exist for MUST survive: when the
+    queue projects to exhaust the DAILY budget (e.g. gemini ~20/day, queue
+    projects 40 calls), S5 fires on the daily (cycle) axis → conserve. Guards
+    that the per-minute exclusion (pp10) did not also blind the overshoot
+    protection.
+    """
+    from nerd_herd.types import QueueProfile, RateLimit, RateLimitMatrix
+
+    now = _time.time()
+    # Small DAILY request budget (20/day) — the perishable, exhaustible axis.
+    matrix = RateLimitMatrix(
+        rpm=RateLimit(limit=10, remaining=10, reset_at=int(now + 60)),
+        rpd=RateLimit(limit=20, remaining=20, reset_at=int(now + 86400)),
+    )
+    snap = _pressure_snapshot(cloud_models={"free_prov": {"free/model": matrix}})
+    snap.queue_profile = QueueProfile(
+        total_ready_count=40, projected_tokens=0, projected_calls=40,  # 2x daily
+    )
+    model = _cloud_model_stub(
+        name="free/model", provider="free_prov", is_free=True, rpd_remaining=20,
+    )
+    bd = snap.pressure_for(model, task_difficulty=5, est_per_task_tokens=1_000)
+    queue = bd.bucket_totals.get("queue", 0.0)
+    failures = []
+    if not (queue <= -0.3):
+        failures.append(
+            f"pp11: daily-overshoot must still conserve (queue bucket < 0), got "
+            f"queue={queue:.3f} — per-minute exclusion blinded the daily axis"
+        )
+    return failures
+
+
+# ── Scenario PP12: Learned B-table reduces demand-pressure through S2/S3 ─────
+
+def assert_pp12_btable_demand_reduces_floor() -> list[str]:
+    """Proves that the learned B-table row drives the per-task token estimate
+    fed to S2/S3 (burden bucket) through _apply_utilization_layer (Site-2).
+
+    Mechanism:
+      ranking.py calls estimate_for(reqs, btable=_bt) → est_per_task_tokens
+      → snapshot.pressure_for(... est_per_task_tokens=...) → S3_task_burden
+      fires on every TOKEN cell (tpm, tpd, …) when est_per_task_tokens /
+      remaining > BITE_THRESHOLD (0.30).
+
+    Setup: a cloud model whose ONLY tight axis is a TPM cell with
+    remaining=50_000. queue_profile is absent (None) so S4/S5 (queue bucket)
+    contribute nothing — the only varying factor is the btable-driven
+    est_per_task_tokens reaching S3.
+
+    Cold run   (btable={}):
+      researcher static default: in=8000 out=2000 iters=24
+      est_per_task_tokens = (8000+2000)×24 = 240_000
+      S3 bite = 240_000/50_000 = 4.8 → excess=4.5 → pressure=-1.0 (floor)
+
+    Seeded run (btable with low p90):
+      row: in_p90=800 out_p90=400 iters_p90=2
+      est_per_task_tokens = (800+400)×2 = 2_400
+      S3 bite = 2_400/50_000 = 0.048 → below BITE_THRESHOLD (0.30) → pressure=0
+
+    Assert: seeded sm.score > cold sm.score (seeded less penalised).
+    Reverting ranking.py's `btable=_bt` to `btable={}` makes BOTH runs equal
+    (same cold estimate) → delta collapses → assertion fails.
+    """
+    from fatih_hoca.btable_cache import set_btable
+    from fatih_hoca.ranking import _apply_utilization_layer, ScoredModel
+    from nerd_herd.types import (
+        CloudModelState, CloudProviderState,
+        RateLimit, RateLimitMatrix, SystemSnapshot, LocalModelState,
+    )
+    from types import SimpleNamespace
+
+    # Tight TPM cell so S3 (per-task token burden) bites hard on the cold
+    # estimate and not at all on the seeded estimate.  No RPD / RPS / queue_profile
+    # → S1/S4/S5 contribute nothing; only S2/S3 vary with the btable.
+    now_ts = int(_time.time() + 3600)
+    tpm_cell = RateLimit(limit=50_000, remaining=50_000, reset_at=now_ts)
+    # Populate a nominal RPD so the model isn't invisible to S1 (remaining > 0
+    # but abundant → S1 ~ 0; burst-cap M1 irrelevant at this scale).
+    rpd_cell = RateLimit(limit=10_000, remaining=10_000, reset_at=int(_time.time() + 86400))
+    matrix = RateLimitMatrix(tpm=tpm_cell, rpd=rpd_cell)
+
+    cms = CloudModelState(
+        model_id="free/m", utilization_pct=0.0, limits=matrix,
+    )
+    cps = CloudProviderState(
+        provider="free_prov", utilization_pct=0.0,
+        consecutive_failures=0, limits=RateLimitMatrix(), models={"free/m": cms},
+    )
+    local = LocalModelState(model_name=None, idle_seconds=0.0, measured_tps=0.0)
+
+    model_stub = SimpleNamespace(
+        name="free/m", litellm_name="free/m",
+        is_local=False, is_free=True, is_loaded=False,
+        provider="free_prov", capabilities=set(),
+        is_thinking=False,
+    )
+
+    step_key = ("researcher", "1.0a", "research")
+    # Seeded row: small est — well below BITE_THRESHOLD on the 50k TPM cell.
+    seeded_row = {"samples_n": 10, "in_p90": 800, "out_p90": 400, "iters_p90": 2}
+
+    def _make_sm() -> ScoredModel:
+        return ScoredModel(model=model_stub, score=100.0,
+                           capability_score=5.0, composite_score=100.0)
+
+    # reqs proxy: agent_type="researcher" + context → estimate_for reads these.
+    reqs_proxy = SimpleNamespace(
+        agent_type="researcher",
+        context={"workflow_step_id": "1.0a", "workflow_phase": "research"},
+    )
+
+    failures = []
+    try:
+        # ── Cold run (btable={}) ─────────────────────────────────────────────
+        # estimate_for falls to AGENT_REQUIREMENTS["researcher"]:
+        #   in=8000, out=2000, iters=24 → total = 240_000
+        # S3 bite = 240_000 / 50_000 = 4.8 → excess 4.5 → pressure = -1.0
+        set_btable({})
+        cold_snap = SystemSnapshot(local=local, cloud={"free_prov": cps})
+        # No queue_profile → S4/S5 = 0, isolating burden bucket.
+        cold_snap.queue_profile = None
+        sm_cold = _make_sm()
+        _apply_utilization_layer([sm_cold], cold_snap, task_difficulty=5,
+                                 reqs=reqs_proxy)
+        cold_score = sm_cold.score  # mutated in-place by the layer
+
+        # ── Seeded run (btable with low p90) ────────────────────────────────
+        # estimate_for hits B-table: in=800, out=400, iters=2 → total = 2_400
+        # S3 bite = 2_400 / 50_000 = 0.048 → below BITE_THRESHOLD → pressure = 0
+        set_btable({step_key: seeded_row})
+        seeded_snap = SystemSnapshot(local=local, cloud={"free_prov": cps})
+        seeded_snap.queue_profile = None
+        sm_seeded = _make_sm()
+        _apply_utilization_layer([sm_seeded], seeded_snap, task_difficulty=5,
+                                 reqs=reqs_proxy)
+        seeded_score = sm_seeded.score
+
+        if not (seeded_score > cold_score):
+            failures.append(
+                f"PP12: seeded btable score ({seeded_score:.3f}) must be GREATER "
+                f"than cold score ({cold_score:.3f}) — btable-driven S2/S3 burden "
+                "not flowing into _apply_utilization_layer (Site-2 wiring broken)"
+            )
+    finally:
+        set_btable({})
+
+    return failures
+
+
+# ── Scenario PP13: aggregate-queue ÷ single-model leak (Residual 2) ──────────
+
+def assert_pp13_aggregate_vs_single_leak() -> list[str]:
+    """The over-conservation leak the fleet-capacity denominator removes: a small
+    daily-window free model (rpd=20) sitting beside an abundant premium (rpd=1000)
+    must NOT be conserve-floored by the WHOLE queue's projected demand — only a
+    fraction routes to it; the fleet (1020) absorbs the rest. Pre-fix (per-model
+    denominator: 40/20 = 2x) this floored the free model and leaked the easy task
+    to paid premium = waste. Reverting S4/S5 to the per-model denominator makes
+    this assertion FAIL (the free model floors again).
+    """
+    from nerd_herd.types import (
+        CloudModelState, CloudProviderState, QueueProfile,
+        RateLimit, RateLimitMatrix, SystemSnapshot,
+    )
+    from types import SimpleNamespace
+
+    now = _time.time()
+    free_m = CloudModelState(model_id="free/m", limits=RateLimitMatrix(
+        rpd=RateLimit(limit=20, remaining=20, reset_at=int(now + 86400))))
+    prem_m = CloudModelState(model_id="prem/m", limits=RateLimitMatrix(
+        rpd=RateLimit(limit=1000, remaining=1000, reset_at=int(now + 86400))))
+    snap = SystemSnapshot(cloud={
+        "free_prov": CloudProviderState(provider="free_prov", models={"free/m": free_m}),
+        "prem_prov": CloudProviderState(provider="prem_prov", models={"prem/m": prem_m}),
+    })
+    snap.queue_profile = QueueProfile(total_ready_count=40, projected_calls=40)
+    model = SimpleNamespace(name="free/m", provider="free_prov", is_free=True,
+                            is_local=False, cap_score=7.0)
+    bd = snap.pressure_for(model, task_difficulty=3, est_per_task_tokens=2_000)
+    queue = bd.bucket_totals.get("queue", 0.0)
+    failures = []
+    if not (queue > -0.3):
+        failures.append(
+            f"pp13: small free model beside abundant premium must stay serviceable "
+            f"(queue bucket ~0), got queue={queue:.3f} — aggregate-÷-single leak"
+        )
+    return failures
+
+
+# ── Registry ─────────────────────────────────────────────────────────────────
+
+POOL_PRESSURE_SCENARIOS = [
+    ("pp1_fat_vs_tiny", pp1_fat_vs_tiny),
+    ("pp2_token_exclusion", pp2_token_exclusion),
+    ("pp3_cold_local_vram", pp3_cold_local_vram),
+    ("pp4_free_cloud_near_reset", pp4_free_cloud_near_reset),
+    ("pp5_paid_flush_no_hard_queue", pp5_paid_flush_no_hard_queue),
+    ("pp6_capability_shortage", pp6_capability_shortage),
+    ("pp7_difficulty_lookahead", pp7_difficulty_lookahead),
+    ("pp8_equilibrium_mission", pp8_equilibrium_mission),
+    ("pp9_giant_vs_small_idle_spread", pp9_giant_vs_small_idle_spread),
+    ("pp10_per_minute_does_not_conserve_floor", pp1_fat_vs_tiny),  # pressure-only
+    ("pp11_daily_overshoot_still_conserves", pp1_fat_vs_tiny),     # pressure-only
+    ("s7_continuity", pp1_fat_vs_tiny),
+    ("s6_conserve", pp1_fat_vs_tiny),
+    ("rp5_overdraw_early_warning", rp5_overdraw_early_warning),
+    ("pp12_btable_demand_reduces_floor", pp1_fat_vs_tiny),  # pressure-only
+    ("pp13_aggregate_vs_single_leak", pp1_fat_vs_tiny),  # pressure-only
+]
+
+# Realistic-pool scenarios — distribution observation (no pass/fail
+# assertions; reported alongside picks so an operator can eyeball
+# whether the distribution shifts make sense for the constraint).
+REALISTIC_POOL_SCENARIOS = [
+    ("rp1_realistic_baseline", rp1_realistic_baseline),
+    ("rp2_gemini_rpd_burned", rp2_gemini_rpd_burned),
+    ("rp3_groq_constrained_premium_intelligent", rp3_groq_constrained_premium_intelligent),
+    ("rp4_full_cloud_exhaustion", rp4_full_cloud_exhaustion),
+    ("rp5_overdraw_early_warning", rp5_overdraw_early_warning),
+]
+
+# Per-scenario assertion callables (scenarios 1-7 pressure-only; 8 full-flow)
+POOL_PRESSURE_ASSERTIONS: dict[str, Callable] = {
+    "pp1_fat_vs_tiny": lambda sc: assert_pp1(sc),
+    "pp2_token_exclusion": lambda sc: assert_pp2(sc),
+    "pp3_cold_local_vram": lambda sc: assert_pp3(sc),
+    "pp4_free_cloud_near_reset": lambda sc: assert_pp4(sc),
+    "pp5_paid_flush_no_hard_queue": lambda sc: assert_pp5(sc),
+    "pp6_capability_shortage": lambda sc: assert_pp6(sc),
+    "pp7_difficulty_lookahead": lambda sc: assert_pp7_m3_weights(),
+    "pp8_equilibrium_mission": lambda sc: assert_pp8(sc),
+    "pp9_giant_vs_small_idle_spread": lambda sc: assert_pp9(sc),
+    "pp10_per_minute_does_not_conserve_floor": lambda sc: assert_pp10_per_minute_window_does_not_conserve_floor(),
+    "pp11_daily_overshoot_still_conserves": lambda sc: assert_pp11_daily_overshoot_still_conserves(),
+    "s7_continuity": lambda sc: assert_s7_continuity(),
+    "s6_conserve": lambda sc: assert_s6_conserve(),
+    "rp5_overdraw_early_warning": lambda sc: assert_rp5(sc),
+    "pp12_btable_demand_reduces_floor": lambda sc: assert_pp12_btable_demand_reduces_floor(),
+    "pp13_aggregate_vs_single_leak": lambda sc: assert_pp13_aggregate_vs_single_leak(),
+}

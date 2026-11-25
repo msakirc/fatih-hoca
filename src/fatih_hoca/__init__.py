@@ -1,0 +1,508 @@
+"""Fatih Hoca — model manager: scoring, selection, swap budget."""
+from __future__ import annotations
+
+from fatih_hoca.types import Pick, Failure, SwapBudget, SelectionFailure
+from fatih_hoca.registry import ModelInfo, ModelRegistry
+from fatih_hoca.requirements import ModelRequirements, AGENT_REQUIREMENTS, CAPABILITY_TO_TASK
+from fatih_hoca.requirements_builder import requirements_for
+from fatih_hoca.capabilities import Cap, ALL_CAPABILITIES, TASK_PROFILES
+from fatih_hoca.ranking import ScoredModel
+from fatih_hoca.selector import Selector
+from fatih_hoca.urgency import mid_task_urgency  # noqa: F401
+from . import schema as _schema  # noqa: F401  registers registry DDL with dabidabi
+
+__all__ = [
+    "init", "select", "is_servable", "all_models", "requirements_for",
+    "Pick", "Failure", "SelectionFailure", "ModelInfo", "ModelRequirements", "ScoredModel",
+    "AGENT_REQUIREMENTS", "CAPABILITY_TO_TASK",
+    "Cap", "ALL_CAPABILITIES", "TASK_PROFILES",
+    "discovery_results",
+    "_is_image_entry",
+    "mid_task_urgency",
+]
+
+
+def _is_image_entry(m) -> bool:
+    """True if m is an image-modality catalog entry; lets benchmark enrichment
+    skip image rows (which lack LLM benchmark fields)."""
+    from .registry import ImageModelInfo
+    return isinstance(m, ImageModelInfo)
+
+_selector: Selector | None = None
+_registry: ModelRegistry | None = None
+
+# Populated by init() — boot caller reads to wire KDV etc.
+discovery_results: dict = {}
+
+_ADAPTERS = None  # lazily built on first init()
+
+
+def _build_adapters() -> dict[str, object]:
+    """Lazy import so test files that monkeypatch _run_cloud_discovery don't pay HTTP-adapter import cost."""
+    from .cloud.providers.groq import GroqAdapter
+    from .cloud.providers.openai import OpenAIAdapter
+    from .cloud.providers.anthropic import AnthropicAdapter
+    from .cloud.providers.gemini import GeminiAdapter
+    from .cloud.providers.cerebras import CerebrasAdapter
+    from .cloud.providers.sambanova import SambanovaAdapter
+    from .cloud.providers.openrouter import OpenRouterAdapter
+    return {
+        "groq": GroqAdapter(),
+        "openai": OpenAIAdapter(),
+        "anthropic": AnthropicAdapter(),
+        "gemini": GeminiAdapter(),
+        "cerebras": CerebrasAdapter(),
+        "sambanova": SambanovaAdapter(),
+        "openrouter": OpenRouterAdapter(),
+    }
+
+
+async def _run_cloud_discovery(api_keys: dict[str, str]) -> dict:
+    """Module-level seam: tests monkeypatch this. Real impl below builds the
+    discovery + throttle + adapters and returns the results map."""
+    return await _run_cloud_discovery_impl(
+        api_keys=api_keys,
+        cache_dir=_default_cache_dir,
+        alert_state_path=_default_alert_state_path,
+        user_alert_fn=_default_alert_fn,
+    )
+
+
+# These three are set at the top of init() so _run_cloud_discovery (the seam)
+# can read them. Pattern keeps the seam signature small (only api_keys) so
+# tests can monkeypatch with a one-arg async function.
+_default_cache_dir: str = ".benchmark_cache/cloud_models"
+_default_alert_state_path: str = ".benchmark_cache/cloud_alert_throttle.json"
+_default_alert_fn = None  # type: ignore[assignment]
+
+
+async def _run_cloud_discovery_impl(
+    api_keys: dict[str, str],
+    cache_dir: str,
+    alert_state_path: str,
+    user_alert_fn,
+) -> dict:
+    from pathlib import Path as _Path
+    from .cloud.discovery import CloudDiscovery
+    from .cloud.alert_throttle import AlertThrottle
+
+    global _ADAPTERS
+    if _ADAPTERS is None:
+        _ADAPTERS = _build_adapters()
+
+    throttle = AlertThrottle(_Path(alert_state_path))
+
+    def _alert(provider: str, status: str, error):
+        if not throttle.should_alert(provider, current_state=status):
+            return
+        if user_alert_fn is None:
+            return
+        try:
+            user_alert_fn(provider, status, error)
+        except Exception as e:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).warning("user_alert_fn raised: %s", e)
+
+    discovery = CloudDiscovery(
+        adapters=_ADAPTERS,
+        cache_dir=_Path(cache_dir),
+        alert_fn=_alert,
+    )
+    return await discovery.refresh_all(api_keys=api_keys)
+
+
+def _run_async(coro):
+    """Run an async coroutine from sync context.
+
+    When an event loop is already running (e.g. pytest-asyncio, or called
+    from an async context via a sync shim), we spin up a NEW loop in a
+    dedicated thread so we don't deadlock the running loop.
+    """
+    import asyncio
+    import concurrent.futures
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None and loop.is_running():
+        # We're inside a running loop — run in a fresh thread with its own loop.
+        result_holder = [None]
+        exception_holder = [None]
+
+        def _thread_target():
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                result_holder[0] = new_loop.run_until_complete(coro)
+            except Exception as e:
+                exception_holder[0] = e
+            finally:
+                new_loop.close()
+
+        t = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = t.submit(_thread_target)
+        future.result()  # blocks current (non-loop) thread until done
+        t.shutdown(wait=False)
+        if exception_holder[0] is not None:
+            raise exception_holder[0]
+        return result_holder[0]
+    else:
+        # No running loop — use asyncio.run() which creates a new loop.
+        return asyncio.run(coro)
+
+
+def init(
+    models_dir: str | None = None,
+    catalog_path: str | None = None,
+    nerd_herd: object = None,
+    available_providers: set[str] | None = None,
+    api_keys: dict[str, str] | None = None,
+    cloud_cache_dir: str = ".benchmark_cache/cloud_models",
+    cloud_alert_state_path: str = ".benchmark_cache/cloud_alert_throttle.json",
+    alert_fn=None,
+) -> list[str]:
+    """Initialize the Fatih Hoca model registry, selector, and run cloud discovery.
+
+    Parameters
+    ----------
+    models_dir : str, optional
+        Directory to scan for GGUF files (local models).
+    catalog_path : str, optional
+        Path to a YAML model catalog (cloud + YAML-declared local models).
+    nerd_herd : object, optional
+        Nerd Herd instance providing system snapshots. If None, a no-op
+        stub is used (snapshot() returns an empty SystemSnapshot).
+    available_providers : set[str], optional
+        Set of cloud provider names that have API keys configured.
+        Cloud models whose provider is not in this set are filtered out.
+        If None, all cloud models are eligible (no API key check).
+    api_keys : dict[str, str], optional
+        Mapping of {provider_name: api_key}. When provided, run discovery
+        probe per provider; auth_ok=True providers join the selector's
+        available set.
+    cloud_cache_dir : str
+        Directory for cloud model discovery cache files.
+    cloud_alert_state_path : str
+        Path for the alert throttle state JSON file.
+    alert_fn : callable, optional
+        callable(provider: str, status: str, error: str | None). Called when
+        discovery confirms a provider failure (after throttle check). Fatih
+        Hoca does NOT import telegram or mr_roboto — boot caller bridges here.
+
+    Returns
+    -------
+    list[str]
+        Names of all models registered.
+    """
+    global _selector, _registry, discovery_results
+    global _default_cache_dir, _default_alert_state_path, _default_alert_fn
+
+    if nerd_herd is None:
+        from nerd_herd.types import SystemSnapshot
+
+        class _NoopNerdHerd:
+            def snapshot(self) -> SystemSnapshot:
+                return SystemSnapshot()
+
+        nerd_herd = _NoopNerdHerd()
+
+    _registry = ModelRegistry()
+    model_names: list[str] = []
+
+    if catalog_path:
+        models = _registry.load_yaml(catalog_path)
+        model_names.extend(m.name for m in models)
+
+    if models_dir:
+        models = _registry.load_gguf_dir(models_dir)
+        model_names.extend(m.name for m in models)
+
+    # Load persisted speed measurements + demoted flags into model objects.
+    # Without this, all models default to 10 tok/s → timeouts are too short.
+    _registry._load_speed_cache()
+
+    # ── Cloud discovery ──────────────────────────────────────────────────────
+    discovery_results = {}
+    if api_keys:
+        # Set module-level defaults so _run_cloud_discovery seam can find them.
+        _default_cache_dir = cloud_cache_dir
+        _default_alert_state_path = cloud_alert_state_path
+        _default_alert_fn = alert_fn
+        try:
+            discovery_results = _run_async(_run_cloud_discovery(api_keys))
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("cloud discovery failed at init: %s", e)
+            discovery_results = {}
+
+        # Fire alert_fn for providers with auth_ok=False (if caller provided one).
+        if alert_fn is not None:
+            for provider, result in discovery_results.items():
+                if not result.auth_ok:
+                    try:
+                        alert_fn(provider, result.status, result.error)
+                    except Exception:
+                        pass
+
+        # Register discovered cloud models BEFORE benchmark enrichment so
+        # they participate in the AA match step.
+        from .registry import register_cloud_from_discovered
+        for provider, result in discovery_results.items():
+            if not result.auth_ok:
+                continue
+            for dm in result.models:
+                try:
+                    register_cloud_from_discovered(_registry, provider, dm)
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "register_cloud_from_discovered failed for %s/%s: %s",
+                        provider, getattr(dm, "litellm_name", "?"), e,
+                    )
+
+        # ── Provider-level registry: key rotation + auth probe ────────
+        # Discovery IS the auth probe. Use its results to:
+        #   1. Detect API key rotation across restarts (hash compare).
+        #      Mismatch → revive any auth-cause provider-dead state so
+        #      the new key gets a clean evaluation by the probe below.
+        #   2. Mark/revive provider rows from auth_ok signal. Replaces
+        #      the old per-model mass-mark loop that ran from caller.py
+        #      on the first runtime auth failure (Step 5b shipped that
+        #      transition; this closes the boot-probe loop so an
+        #      operator who FIXES creds and restarts doesn't carry
+        #      stale auth dead state across reboot).
+        from fatih_hoca import registry_store as _rs
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        for _provider, _key in api_keys.items():
+            _new_hash = _rs.hash_key(_key)
+            _old_hash = _rs.get_provider_key_hash(_provider)
+            if _old_hash and _new_hash and _new_hash != _old_hash:
+                # Key rotated since last persisted hash. Revive provider
+                # so this boot's probe re-evaluates from a clean slate.
+                # actor!='auto' bypasses revive_provider's manual_revive
+                # gate (provider revive doesn't currently gate, but stay
+                # explicit for symmetry with the model-level path).
+                _registry.revive_provider(_provider, actor="key_rotation")
+                _log.info(
+                    "registry: key rotation detected on %s — auto-revived",
+                    _provider,
+                )
+            if _new_hash:
+                _rs.register_provider(_provider, key_hash=_new_hash)
+        for _provider, _result in discovery_results.items():
+            if not _result.auth_ok:
+                # Boot probe failed auth. Single provider row excludes
+                # every cloud model on this provider via selector's
+                # is_provider_dead gate. cause='auth' has no TTL —
+                # operator must fix creds + /restart (which re-runs
+                # discovery and clears the row on success below).
+                _registry.mark_provider_dead(
+                    _provider, cause="auth", actor="discovery_probe",
+                )
+                _log.warning(
+                    "registry: discovery auth_ok=False on %s — "
+                    "provider marked dead (status=%s)",
+                    _provider, _result.status,
+                )
+            elif _registry.is_provider_dead(_provider):
+                # Probe succeeded; provider was previously marked dead
+                # (e.g. earlier auth failure, then operator fixed creds
+                # without /revive). Auto-revive — discovery's positive
+                # signal beats stale auth lockout.
+                _registry.revive_provider(
+                    _provider, actor="discovery_probe",
+                )
+                _log.info(
+                    "registry: discovery probe ok on %s — auto-revived",
+                    _provider,
+                )
+
+        # ── Revive previously-dead ids that re-appeared in discovery ──
+        # The runtime 404 hook (registry.mark_dead) is the AUTHORITATIVE
+        # signal for "this id no longer responds." Cross-check used to
+        # ALSO mark-dead any registered model missing from /models, but
+        # that diff is too coarse to be trusted: provider /models
+        # responses are tier-filtered, paginated, schema-drifty, and a
+        # single-pass mismatch can mark every yaml entry dead in one
+        # shot (production 2026-05-02: 16 gemini + 33 openrouter ids
+        # all marked dead from one degraded discovery, persisted to
+        # .dead_models.json across restarts; selector returned None on
+        # every cloud-fallback path). A 404 at call time is unambiguous;
+        # absence from /models is not.
+        #
+        # We KEEP the symmetric revive path: if a previously-dead id
+        # shows up in this provider's live set, the operator/discovery
+        # is telling us the id is back. Combined with the runtime hook,
+        # the only way an id stays dead is if it actually returned 404
+        # from a live call AND has not since been re-published.
+        # NOTE: the model-level revive() now honors CAUSE_POLICY's
+        # manual_revive flag — for 404_permanent (manual_revive=True),
+        # discovery's actor='auto' default is refused (cerebras gpt-oss-
+        # 120b cycle fix). Operator /revive overrides via actor='user'.
+        for provider, result in discovery_results.items():
+            if not result.auth_ok or result.status != "ok":
+                continue
+            live_litellm = {dm.litellm_name for dm in result.models}
+            revived = []
+            for ln in list(live_litellm):
+                if _registry.is_dead(ln):
+                    _registry.revive(ln)
+                    revived.append(ln)
+            if revived:
+                _log.info(
+                    "discovery: %d previously-dead ids revived on %s: %s",
+                    len(revived), provider, ", ".join(revived[:5]),
+                )
+
+    # ── Benchmark enrichment: populate ModelInfo.benchmark_scores from cached AA data ──
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        from src.models.benchmark.benchmark_fetcher import enrich_registry_with_benchmarks
+
+        enrich_registry_with_benchmarks(_registry)
+        all_models_list = _registry.all_models()
+        matched = sum(1 for m in all_models_list if m.benchmark_scores)
+        total = len(all_models_list)
+        unmatched = [m.name for m in all_models_list if not m.benchmark_scores]
+
+        logger.info(
+            "benchmark coverage: %d/%d matched (unmatched=%d)",
+            matched, total, len(unmatched),
+        )
+        if unmatched:
+            logger.warning(
+                "benchmark coverage: %d unmatched models — %s",
+                len(unmatched), ", ".join(unmatched[:10]),
+            )
+    except Exception as e:
+        logger.warning("benchmark enrichment failed at init: %s", e)
+
+    # ── Blend profile + benchmark into final capabilities vector ──
+    try:
+        from .auto_tuner import blend_capability_scores
+
+        for m in _registry.all_models():
+            if not m.benchmark_scores:
+                continue
+            blended = blend_capability_scores(
+                profile_scores=dict(m.capabilities),
+                benchmark_scores=dict(m.benchmark_scores),
+                grading_scores={},
+                grading_call_count=0,
+            )
+            m.capabilities = blended
+    except Exception as e:
+        logger.warning("capability blending failed at init: %s", e)
+
+    # ── Cloud bench match (family-aware, gated by operator approval) ──
+    try:
+        from .benchmark_cloud_match import apply_cloud_benchmarks, write_review_artifact
+
+        # Build {family: {capability: score}} lookup from per-model benchmark_scores
+        # populated by the local enricher above. Cross-provider clones share via family.
+        from .cloud.family import normalize as _family_normalize
+        aa_lookup: dict[str, dict[str, float]] = {}
+        for m in _registry.all_models():
+            if not m.benchmark_scores:
+                continue
+            family = m.family or _family_normalize(m.provider, m.litellm_name or m.name)
+            if not family:
+                continue
+            aa_lookup.setdefault(family, dict(m.benchmark_scores))
+
+        # Resolve approval + review artifact paths inside the cloud cache dir.
+        from pathlib import Path as _Path
+        cache_root = _Path(cloud_cache_dir) if cloud_cache_dir else _Path(".benchmark_cache")
+        approved_path = cache_root / "cloud_match_approved.json"
+        review_path = cache_root / "cloud_match_review.json"
+
+        models_list = list(_registry.all_models())
+        apply_cloud_benchmarks(models_list, aa_lookup, approved_path=approved_path)
+        write_review_artifact(models_list, aa_lookup, output_path=review_path)
+    except Exception as e:
+        logger.warning("cloud benchmark match failed at init: %s", e)
+
+    # ── Compute final available_providers ────────────────────────────────────
+    # Caller-provided set is the universe ("I have keys for these"). When
+    # discovery ran, intersect with the auth_ok subset. When discovery did
+    # not run (no api_keys passed), trust the caller-provided set as-is.
+    if discovery_results:
+        auth_ok_providers = {p for p, r in discovery_results.items() if r.auth_ok}
+        if available_providers is not None:
+            final_providers = available_providers & auth_ok_providers
+        else:
+            final_providers = auth_ok_providers
+    else:
+        final_providers = available_providers
+
+    _selector = Selector(
+        registry=_registry,
+        nerd_herd=nerd_herd,
+        available_providers=final_providers,
+    )
+    return model_names
+
+
+def select(**kwargs) -> Pick | None:
+    """
+    Select the best model for a task.
+
+    Keyword arguments are forwarded to Selector.select(). Returns a Pick
+    with the chosen model and estimated min_time_seconds, or None if no
+    eligible model was found or if init() has not been called.
+
+    See Selector.select() for the full list of keyword arguments.
+    """
+    # Image modality short-circuit. Runs BEFORE any text-model machinery.
+    if kwargs.pop("needs_image", False):
+        from .image_select import select_image
+        raw_failures = kwargs.get("failures") or []
+        # Normalize to plain name strings. Callers may pass:
+        #   - plain strings; - real fatih_hoca Failure (where `.model` is a STRING);
+        #   - objects with `.model.name`.
+        failures: list[str] = []
+        for f in raw_failures:
+            if isinstance(f, str):
+                name = f
+            else:
+                m = getattr(f, "model", None)
+                name = m if isinstance(m, str) else getattr(m, "name", None)
+            if name:
+                failures.append(name)
+        return select_image(
+            quality_tier=kwargs.get("quality_tier", "fast"),
+            failures=failures,
+            remaining_budget_usd=kwargs.get("remaining_budget_usd"),
+        )
+
+    if _selector is None:
+        return None
+    return _selector.select(**kwargs)
+
+
+def is_servable(*, model, reqs) -> bool:
+    """Per-model continuation gate (RC-A, mission 74).
+
+    True when ``model`` would still pass hard-eligibility for ``reqs``
+    against the current snapshot — the "can I keep running on what I
+    already hold" check, with no pool-pressure gate. Fail-closed (False)
+    before init() so the caller re-selects rather than reusing a stale pick.
+    """
+    if _selector is None:
+        return False
+    return _selector.is_servable(model=model, reqs=reqs)
+
+
+def all_models() -> list[ModelInfo]:
+    """
+    Return all models currently in the registry.
+
+    Returns an empty list if init() has not been called.
+    """
+    if _registry is None:
+        return []
+    return _registry.all_models()

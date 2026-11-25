@@ -1,0 +1,710 @@
+# test_selector.py
+"""Tests for fatih_hoca.selector — eligibility filtering and select()."""
+from __future__ import annotations
+
+import pytest
+from unittest.mock import MagicMock
+
+from fatih_hoca.selector import Selector
+from fatih_hoca.registry import ModelInfo, ModelRegistry
+from fatih_hoca.requirements import ModelRequirements
+from fatih_hoca.types import Failure, Pick
+from nerd_herd.types import SystemSnapshot, LocalModelState, CloudProviderState
+
+
+# ─── Fixtures / Helpers ───────────────────────────────────────────────────────
+
+def _make_registry(*models: ModelInfo) -> ModelRegistry:
+    reg = ModelRegistry()
+    for m in models:
+        reg.register(m)
+    return reg
+
+
+def _make_nerd_herd(
+    vram_available_mb: int = 8192,
+    local_model_name: str | None = None,
+    local_loaded: bool = False,
+) -> MagicMock:
+    snap = SystemSnapshot(vram_available_mb=vram_available_mb)
+    if local_model_name:
+        snap.local = LocalModelState(
+            model_name=local_model_name,
+            measured_tps=20.0,
+        )
+    nh = MagicMock()
+    nh.snapshot.return_value = snap
+    nh.can_swap.return_value = True
+    nh.recent_swap_count.return_value = 0
+    return nh
+
+
+def _make_model(
+    name: str = "test-model",
+    location: str = "local",
+    provider: str = "llama_cpp",
+    litellm_name: str | None = None,
+    capabilities: dict | None = None,
+    tps: float = 20.0,
+    context: int = 32768,
+    function_calling: bool = True,
+    has_vision: bool = False,
+    demoted: bool = False,
+    specialty: str = "",
+    is_loaded: bool = False,
+    tier: str = "paid",
+    cost_in: float = 0.0,
+    cost_out: float = 0.0,
+    thinking_model: bool = False,
+) -> ModelInfo:
+    caps = capabilities or {
+        "reasoning": 7.0,
+        "code_generation": 7.0,
+        "tool_use": 6.0,
+        "instruction_adherence": 6.0,
+    }
+    return ModelInfo(
+        name=name,
+        location=location,
+        provider=provider,
+        litellm_name=litellm_name or (f"openai/{name}" if location == "local" else f"{provider}/{name}"),
+        capabilities=caps,
+        tokens_per_second=tps,
+        context_length=context,
+        supports_function_calling=function_calling,
+        has_vision=has_vision,
+        demoted=demoted,
+        specialty=specialty,
+        is_loaded=is_loaded,
+        tier=tier,
+        cost_per_1k_input=cost_in,
+        cost_per_1k_output=cost_out,
+        thinking_model=thinking_model,
+    )
+
+
+def _make_selector(
+    models: list[ModelInfo] | None = None,
+    vram_available_mb: int = 8192,
+) -> Selector:
+    reg = _make_registry(*(models or []))
+    nh = _make_nerd_herd(vram_available_mb=vram_available_mb)
+    return Selector(registry=reg, nerd_herd=nh)
+
+
+# ─── Basic contract tests ─────────────────────────────────────────────────────
+
+def test_select_returns_pick_with_valid_model():
+    model = _make_model("alpha")
+    sel = _make_selector([model])
+    result = sel.select(task="coder", difficulty=5)
+    assert result is not None
+    assert isinstance(result, Pick)
+    assert result.model.name == "alpha"
+    assert result.min_time_seconds > 0
+
+
+def test_select_returns_none_when_no_models():
+    sel = _make_selector([])
+    result = sel.select(task="coder", difficulty=5)
+    assert result is None
+
+
+# ─── Demand-floor gate: supply vetoes, demand only ranks (2026-06-18) ─────────
+# The utilization scalar is a SOFT composite multiplier by design (composite *=
+# 1 + K*scalar; -1.0 = rank-last, not exclude). The admission gate must veto
+# ONLY on genuine SUPPLY exhaustion (the `other` bucket at the floor), never on
+# DEMAND (burden+queue), or a deep queue deadlocks the whole fleet under minimal
+# (cloud-only) — the live 2026-06-17 stall. And the demand-floor fallback must
+# rank by the pre-demand base composite, or a premium model that escaped the
+# demand floor would grab easy tasks (waste).
+
+def _scored(model, *, urgency, supply, base):
+    from fatih_hoca.ranking import ScoredModel
+    # `score` mirrors the post-demand composite (base * (1+K*urgency), K=1,
+    # floored at 0) — i.e. demand-floored models are zeroed, exactly as ranking
+    # produces them. The gate must NOT use this for the fallback ordering.
+    sm = ScoredModel(model=model, score=max(0.0, base * (1.0 + urgency)),
+                     capability_score=base, composite_score=0.0)
+    sm.urgency = urgency
+    sm.supply_pressure = supply
+    sm.base_score = base
+    sm.pool = "time_bucketed" if getattr(model, "is_free", False) else "per_call"
+    return sm
+
+
+def test_demand_floored_fleet_admits_best_by_base_not_stall(monkeypatch):
+    # All candidates demand-floored (urgency=-1) but supply-HEALTHY (supply=0).
+    # Pre-fix: gate filtered every urgency==-1.0 -> empty -> select=None stall.
+    # Post-fix: demand never vetoes; fallback ranks by base composite. The cheap
+    # free model (higher base on an easy task) wins -- premium does NOT, even
+    # though demand zeroed both `score`s.
+    cheap = _make_model("cheap-free", location="cloud", provider="gemini", tier="free")
+    prem = _make_model("premium", location="cloud", provider="anthropic", tier="paid")
+    sel = _make_selector([cheap, prem])
+    # NOTE: `score` is 0 for both (demand ×0). Only base_score separates them.
+    scored = [
+        _scored(prem, urgency=-1.0, supply=0.0, base=40.0),
+        _scored(cheap, urgency=-1.0, supply=0.0, base=80.0),
+    ]
+    monkeypatch.setattr("fatih_hoca.selector.rank_candidates", lambda **kw: scored)
+    result = sel.select(task="summarizer", difficulty=3)
+    assert result is not None, "demand-floored but supply-healthy fleet must NOT stall"
+    assert result.model.name == "cheap-free", (
+        "fallback must rank by base composite (easy->cheap), not the demand-"
+        "zeroed score that would let the premium model escape and waste"
+    )
+
+
+def test_supply_exhausted_fleet_still_vetoes(monkeypatch):
+    # Genuine supply exhaustion (supply<=-1) MUST still veto -> None. This is the
+    # 'don't re-pick dead models' guard, correctly scoped to the supply floor.
+    dead = _make_model("dead-free", location="cloud", provider="gemini", tier="free")
+    sel = _make_selector([dead])
+    scored = [_scored(dead, urgency=-1.0, supply=-1.0, base=80.0)]
+    monkeypatch.setattr("fatih_hoca.selector.rank_candidates", lambda **kw: scored)
+    result = sel.select(task="summarizer", difficulty=3)
+    assert result is None, "supply-exhausted fleet must veto (return None)"
+
+
+# ─── Eligibility: demoted models ─────────────────────────────────────────────
+
+def test_select_excludes_demoted_models():
+    demoted = _make_model("demoted", demoted=True)
+    sel = _make_selector([demoted])
+    result = sel.select(task="coder", difficulty=5)
+    assert result is None
+
+
+def test_select_picks_non_demoted_when_demoted_also_present():
+    demoted = _make_model("demoted", demoted=True)
+    good = _make_model("good", demoted=False)
+    sel = _make_selector([demoted, good])
+    result = sel.select(task="coder", difficulty=5)
+    assert result is not None
+    assert result.model.name == "good"
+
+
+# ─── Eligibility: context length ─────────────────────────────────────────────
+
+def test_select_filters_by_context():
+    small_ctx = _make_model("small", context=4096)
+    sel = _make_selector([small_ctx])
+    # Request more context than the model supports
+    result = sel.select(
+        task="coder",
+        difficulty=5,
+        estimated_input_tokens=4000,
+        estimated_output_tokens=2000,
+        min_context_length=8192,
+    )
+    assert result is None
+
+
+def test_select_passes_model_with_sufficient_context():
+    large_ctx = _make_model("large", context=32768)
+    sel = _make_selector([large_ctx])
+    result = sel.select(
+        task="coder",
+        difficulty=5,
+        min_context_length=8192,
+    )
+    assert result is not None
+    assert result.model.name == "large"
+
+
+# ─── Eligibility: failures ────────────────────────────────────────────────────
+
+def test_select_with_failures_avoids_failed_model():
+    model = _make_model("failed-model", litellm_name="openai/failed-model")
+    sel = _make_selector([model])
+    failures = [Failure(model="openai/failed-model", reason="timeout")]
+    result = sel.select(task="coder", difficulty=5, failures=failures)
+    assert result is None
+
+
+def test_select_picks_unfailed_model():
+    failed = _make_model("failed", litellm_name="openai/failed")
+    good = _make_model("good", litellm_name="openai/good")
+    reg = _make_registry(failed, good)
+    nh = _make_nerd_herd()
+    sel = Selector(registry=reg, nerd_herd=nh)
+    failures = [Failure(model="openai/failed", reason="server_error")]
+    result = sel.select(task="coder", difficulty=5, failures=failures)
+    assert result is not None
+    assert result.model.name == "good"
+
+
+# ─── Eligibility: function calling ───────────────────────────────────────────
+
+def test_select_respects_needs_function_calling():
+    no_fc = _make_model("no-fc", function_calling=False)
+    sel = _make_selector([no_fc])
+    result = sel.select(task="coder", difficulty=5, needs_function_calling=True)
+    assert result is None
+
+
+def test_select_picks_model_with_function_calling():
+    no_fc = _make_model("no-fc", function_calling=False)
+    with_fc = _make_model("with-fc", function_calling=True)
+    sel = _make_selector([no_fc, with_fc])
+    result = sel.select(task="coder", difficulty=5, needs_function_calling=True)
+    assert result is not None
+    assert result.model.name == "with-fc"
+
+
+def test_select_floors_function_calling_from_agent_profile():
+    """Regression: caller may omit needs_function_calling=True between
+    ReAct iterations or for constrained_emit paths, but the agent profile
+    in AGENT_REQUIREMENTS is the source of truth. Selector must floor
+    needs_function_calling from the profile so models flagged
+    supports_function_calling=False (groq/compound, prompt-guard,
+    safeguard-20b, allam-2-7b) cannot leak into the candidate pool.
+    Production 2026-05-01: prompt-guard-2-22m picked for test_generator."""
+    no_fc = _make_model("no-fc", function_calling=False)
+    with_fc = _make_model("with-fc", function_calling=True)
+    sel = _make_selector([no_fc, with_fc])
+    # Caller does NOT pass needs_function_calling — selector must look up
+    # AGENT_REQUIREMENTS["test_generator"].needs_function_calling=True.
+    result = sel.select(task="test_generator", difficulty=5)
+    assert result is not None
+    assert result.model.name == "with-fc"
+
+
+def test_select_floors_function_calling_via_agent_type():
+    """Profile lookup should also consult agent_type when task is empty."""
+    no_fc = _make_model("no-fc", function_calling=False)
+    with_fc = _make_model("with-fc", function_calling=True)
+    sel = _make_selector([no_fc, with_fc])
+    result = sel.select(task="", agent_type="coder", difficulty=5)
+    assert result is not None
+    assert result.model.name == "with-fc"
+
+
+def test_select_admits_json_schema_model_without_native_fc():
+    """A model lacking native function-calling (tools= param) but with strict
+    json_schema constrained decoding CAN drive the agent loop: coulson parses
+    tool actions from response_format text-JSON, no native tool_calls needed.
+    It must be eligible for needs_function_calling tasks, not vetoed.
+
+    Regression 2026-06-17: Apriel-1.6-15b-Thinker runs --no-jinja (llama-server
+    rejects the tools= param → supports_function_calling=False) yet keeps
+    supports_json_schema=True. The old veto filtered it out of analyst/researcher
+    ~150k times in an 8h window despite it being fully agent-capable."""
+    apriel = _make_model("apriel-thinker", function_calling=False)
+    apriel.supports_json_schema = True
+    sel = _make_selector([apriel])
+    result = sel.select(task="coder", difficulty=5, needs_function_calling=True)
+    assert result is not None
+    assert result.model.name == "apriel-thinker"
+
+
+def test_select_still_vetoes_model_without_fc_or_json_schema():
+    """Degenerate models (groq/compound router, gpt-oss-safeguard /
+    prompt-guard classifiers) are FC=False AND json_schema=False — they
+    cannot produce structured agent output via either path. The veto must
+    still exclude them so they never leak into tool-using agent pools
+    (2026-05-01 DLQ: prompt-guard-2-22m picked for test_generator)."""
+    degenerate = _make_model("compound", location="cloud", provider="groq",
+                             function_calling=False)
+    # supports_json_schema stays False (default) — routers/classifiers can't
+    # constrain-decode arbitrary agent JSON.
+    sel = _make_selector([degenerate])
+    result = sel.select(task="coder", difficulty=5, needs_function_calling=True)
+    assert result is None
+
+
+# ─── Eligibility: needs_json_mode plumbing ───────────────────────────────────
+
+
+def test_select_accepts_needs_json_mode_kwarg():
+    """Regression: dispatcher passes needs_json_mode=True when caller
+    supplies response_format. Pre-fix, selector.select() raised
+    TypeError('unexpected keyword argument 'needs_json_mode'') because
+    the parameter wasn't in the signature, dropping every constrained_emit
+    call back to draft (logged as 'constrained_emit dispatch failed:
+    TypeError... — keeping draft' on production 2026-05-01)."""
+    model = _make_model("any")
+    model.supports_json_mode = True
+    sel = _make_selector([model])
+    # Must NOT raise.
+    result = sel.select(
+        task="coder", difficulty=5, needs_function_calling=True,
+        needs_json_mode=True,
+    )
+    assert result is not None
+
+
+def test_select_filters_models_without_json_mode_when_required():
+    """When needs_json_mode=True, models with supports_json_mode=False
+    must be excluded by eligibility."""
+    no_json = _make_model("no-json")
+    no_json.supports_json_mode = False
+    with_json = _make_model("with-json")
+    with_json.supports_json_mode = True
+    sel = _make_selector([no_json, with_json])
+    result = sel.select(
+        task="coder", difficulty=5, needs_function_calling=True,
+        needs_json_mode=True,
+    )
+    assert result is not None
+    assert result.model.name == "with-json"
+
+
+# ─── Eligibility: vision ──────────────────────────────────────────────────────
+
+def test_select_respects_needs_vision():
+    no_vision = _make_model("no-vision", has_vision=False)
+    sel = _make_selector([no_vision])
+    result = sel.select(task="visual_reviewer", difficulty=5, needs_vision=True)
+    assert result is None
+
+
+def test_select_picks_vision_model():
+    no_vision = _make_model("no-vision", has_vision=False)
+    with_vision = _make_model(
+        "vision",
+        has_vision=True,
+        capabilities={
+            "reasoning": 7.0,
+            "vision": 8.0,
+            "code_generation": 6.0,
+            "tool_use": 6.0,
+            "instruction_adherence": 7.0,
+        },
+    )
+    sel = _make_selector([no_vision, with_vision])
+    result = sel.select(task="visual_reviewer", difficulty=5, needs_vision=True)
+    assert result is not None
+    assert result.model.name == "vision"
+
+
+# ─── Eligibility: local_only ─────────────────────────────────────────────────
+
+def test_select_local_only_rejects_cloud():
+    cloud_model = _make_model(
+        "cloud", location="cloud", provider="anthropic",
+        litellm_name="anthropic/claude",
+    )
+    sel = _make_selector([cloud_model])
+    result = sel.select(task="coder", difficulty=5, local_only=True)
+    assert result is None
+
+
+def test_select_local_only_picks_local():
+    local = _make_model("local")
+    cloud = _make_model("cloud", location="cloud", provider="anthropic",
+                        litellm_name="anthropic/claude")
+    sel = _make_selector([local, cloud])
+    result = sel.select(task="coder", difficulty=5, local_only=True)
+    assert result is not None
+    assert result.model.name == "local"
+
+
+# ─── Eligibility: exclude_models ─────────────────────────────────────────────
+
+def test_select_respects_exclude_models():
+    model = _make_model("excluded", litellm_name="openai/excluded")
+    sel = _make_selector([model])
+    result = sel.select(task="coder", exclude_models=["openai/excluded"])
+    assert result is None
+
+
+# ─── Swap budget ─────────────────────────────────────────────────────────────
+
+def test_select_with_exhausted_swap_budget_prefers_loaded():
+    """When swap budget is exhausted, prefer already-loaded model over swap."""
+    loaded = _make_model("loaded", is_loaded=True)
+    unloaded = _make_model(
+        "unloaded",
+        is_loaded=False,
+        capabilities={
+            "reasoning": 9.0,
+            "code_generation": 9.0,
+            "tool_use": 8.0,
+            "instruction_adherence": 8.0,
+        },
+    )
+    reg = _make_registry(loaded, unloaded)
+    nh = _make_nerd_herd()
+    # Drive swap exhaustion via the nerd_herd mock — selector delegates to it
+    nh.can_swap.return_value = False
+    nh.recent_swap_count.return_value = 3
+    sel = Selector(registry=reg, nerd_herd=nh)
+
+    result = sel.select(task="coder", difficulty=5, priority=5)
+    # Unloaded wins on score but swap denied — selector falls back to loaded
+    assert result is not None
+    assert result.model.name == "loaded"
+
+
+def test_select_swap_budget_none_when_exhausted_and_no_alternative():
+    """When swap budget is exhausted and no loaded/cloud model is available, return None."""
+    unloaded = _make_model("unloaded", is_loaded=False)
+    reg = _make_registry(unloaded)
+    nh = _make_nerd_herd()
+    # Drive swap exhaustion via the nerd_herd mock
+    nh.can_swap.return_value = False
+    nh.recent_swap_count.return_value = 3
+    sel = Selector(registry=reg, nerd_herd=nh)
+
+    result = sel.select(task="coder", difficulty=5, priority=5)
+    assert result is None
+
+
+def test_select_swap_budget_exempt_for_high_priority():
+    """Priority >= 9 is exempt from swap budget."""
+    unloaded = _make_model("unloaded", is_loaded=False)
+    reg = _make_registry(unloaded)
+    nh = _make_nerd_herd()
+    # Budget exhausted for normal priority, but exempt for priority >= 9
+    def can_swap_side_effect(local_only=False, priority=5):
+        if local_only or priority >= 9:
+            return True
+        return False
+    nh.can_swap.side_effect = can_swap_side_effect
+    nh.recent_swap_count.return_value = 3
+    sel = Selector(registry=reg, nerd_herd=nh)
+
+    # Priority 9 is exempt — should still work
+    result = sel.select(task="coder", difficulty=5, priority=9)
+    assert result is not None
+    assert result.model.name == "unloaded"
+
+
+def test_select_swap_budget_exempt_for_local_only():
+    """local_only requests are exempt from swap budget."""
+    unloaded = _make_model("unloaded", is_loaded=False)
+    reg = _make_registry(unloaded)
+    nh = _make_nerd_herd()
+    # Budget exhausted for normal requests, but exempt for local_only
+    def can_swap_side_effect(local_only=False, priority=5):
+        if local_only or priority >= 9:
+            return True
+        return False
+    nh.can_swap.side_effect = can_swap_side_effect
+    nh.recent_swap_count.return_value = 3
+    sel = Selector(registry=reg, nerd_herd=nh)
+
+    result = sel.select(task="coder", difficulty=5, local_only=True)
+    assert result is not None
+
+
+# ─── min_time_seconds calculation ────────────────────────────────────────────
+
+def test_select_min_time_calculation():
+    model = _make_model("fast", tps=50.0)
+    sel = _make_selector([model])
+    result = sel.select(
+        task="coder",
+        estimated_output_tokens=1000,
+        needs_thinking=False,
+    )
+    assert result is not None
+    # 1000 tokens / 50 tps = 20s
+    assert abs(result.min_time_seconds - 20.0) < 0.1
+
+
+def test_select_min_time_thinking_multiplier():
+    model = _make_model("thinker", tps=20.0, thinking_model=True)
+    sel = _make_selector([model])
+    result = sel.select(
+        task="coder",
+        estimated_output_tokens=200,
+        needs_thinking=True,
+    )
+    assert result is not None
+    # 200 / 20 = 10s, × 3 for thinking = 30s
+    assert abs(result.min_time_seconds - 30.0) < 0.1
+
+
+# ─── Circuit breaker ─────────────────────────────────────────────────────────
+
+def test_select_rejects_cloud_with_circuit_breaker_open():
+    cloud = _make_model(
+        "claude",
+        location="cloud",
+        provider="anthropic",
+        litellm_name="anthropic/claude",
+    )
+    snap = SystemSnapshot(vram_available_mb=8192)
+    snap.cloud["anthropic"] = CloudProviderState(
+        provider="anthropic",
+        consecutive_failures=5,
+    )
+    nh = MagicMock()
+    nh.snapshot.return_value = snap
+
+    reg = _make_registry(cloud)
+    sel = Selector(registry=reg, nerd_herd=nh)
+    result = sel.select(task="coder", difficulty=5)
+    assert result is None
+
+
+def test_select_rejects_cloud_with_rpm_cooldown():
+    """Per-model rpm_cooldown is set when KDV records a Retry-After /
+    x-ratelimit-reset floor with remaining=0. Selector eligibility must
+    reject — otherwise after the 5s header freshness expires, KDV's
+    rpm_remaining property reverts to sliding-window math, the model
+    looks free, selector picks it, and the next call eats a guaranteed
+    429. Same shape as daily_exhausted, per-minute axis."""
+    from nerd_herd.types import CloudModelState
+    cloud = _make_model(
+        "claude",
+        location="cloud",
+        provider="anthropic",
+        litellm_name="anthropic/claude",
+    )
+    snap = SystemSnapshot(vram_available_mb=8192)
+    snap.cloud["anthropic"] = CloudProviderState(
+        provider="anthropic",
+        models={
+            "anthropic/claude": CloudModelState(
+                model_id="anthropic/claude",
+                rpm_cooldown=True,
+            ),
+        },
+    )
+    nh = MagicMock()
+    nh.snapshot.return_value = snap
+
+    reg = _make_registry(cloud)
+    sel = Selector(registry=reg, nerd_herd=nh)
+    result = sel.select(task="coder", difficulty=5)
+    assert result is None
+
+
+def test_select_rejects_cloud_with_provider_dead():
+    """Provider-level dead replaces the legacy per-model mass-mark loop:
+    a single mark_provider_dead row excludes every cloud model on the
+    provider via the eligibility gate. cause='auth' has no TTL —
+    operator must /revive after fixing credentials."""
+    cloud = _make_model(
+        "claude",
+        location="cloud",
+        provider="anthropic",
+        litellm_name="anthropic/claude",
+    )
+    snap = SystemSnapshot(vram_available_mb=8192)
+    nh = MagicMock()
+    nh.snapshot.return_value = snap
+
+    reg = _make_registry(cloud)
+    reg.mark_provider_dead("anthropic", cause="auth", actor="caller")
+    sel = Selector(registry=reg, nerd_herd=nh)
+    result = sel.select(task="coder", difficulty=5)
+    assert result is None
+
+    # After /revive the same model is eligible again.
+    reg.revive_provider("anthropic", actor="user")
+    result = sel.select(task="coder", difficulty=5)
+    assert result is not None
+    assert result.model.litellm_name == "anthropic/claude"
+
+
+def test_select_accepts_cloud_with_circuit_breaker_below_threshold():
+    cloud = _make_model(
+        "claude",
+        location="cloud",
+        provider="anthropic",
+        litellm_name="anthropic/claude",
+        capabilities={
+            "reasoning": 9.0,
+            "code_generation": 9.0,
+            "tool_use": 8.0,
+            "instruction_adherence": 8.0,
+        },
+    )
+    snap = SystemSnapshot(vram_available_mb=8192)
+    snap.cloud["anthropic"] = CloudProviderState(
+        provider="anthropic",
+        consecutive_failures=4,  # 4 < 5, circuit still closed
+    )
+    nh = MagicMock()
+    nh.snapshot.return_value = snap
+
+    reg = _make_registry(cloud)
+    sel = Selector(registry=reg, nerd_herd=nh)
+    result = sel.select(task="coder", difficulty=5)
+    assert result is not None
+    assert result.model.name == "claude"
+
+
+# ─── VRAM availability ────────────────────────────────────────────────────────
+
+def test_select_rejects_local_when_no_vram():
+    model = _make_model("local")
+    reg = _make_registry(model)
+    nh = _make_nerd_herd(vram_available_mb=0)
+    sel = Selector(registry=reg, nerd_herd=nh)
+    result = sel.select(task="coder", difficulty=5)
+    assert result is None
+
+
+def test_select_local_with_vram():
+    model = _make_model("local")
+    sel = _make_selector([model], vram_available_mb=8192)
+    result = sel.select(task="coder", difficulty=5)
+    assert result is not None
+
+
+# ─── Coding specialty mismatch ────────────────────────────────────────────────
+
+def test_select_holds_when_free_tier_rpm_saturated():
+    """User feedback 2026-05-01: 'every provider's free-tier RPM is
+    indeed genuinely insufficient. pool pressures should respect that
+    and hold the dispatch accordingly'.
+
+    When the only candidate is a free-tier cloud model and its RPM
+    matrix cell shows remaining=0 (sliding-window saturated, synthetic
+    backoff applied, or 429-body parsed limit:0), S1 fires depletion_max
+    -1.0. Selector's strict >−1.0 gate excludes it. select() returns
+    None — beckman defers admission this tick. After RPM bucket recovers
+    (sliding window or reset_at), pressure rebounds and selector picks
+    on the next tick. This is the HOLD path."""
+    from nerd_herd.types import RateLimit, RateLimitMatrix
+
+    cloud = _make_model(
+        "free-tier-flash",
+        location="cloud",
+        provider="gemini",
+        litellm_name="gemini/free-tier-flash",
+        tier="free",
+        cost_in=0.0, cost_out=0.0,
+    )
+
+    # RPM saturation: limit=5, remaining=0 → S1 fires -1.0
+    snap = SystemSnapshot(vram_available_mb=8192)
+    snap.cloud["gemini"] = CloudProviderState(
+        provider="gemini",
+        consecutive_failures=0,
+        limits=RateLimitMatrix(rpm=RateLimit(limit=5, remaining=0, reset_at=0)),
+    )
+    nh = MagicMock()
+    nh.snapshot.return_value = snap
+    nh.recent_swap_count.return_value = 0
+
+    reg = _make_registry(cloud)
+    sel = Selector(registry=reg, nerd_herd=nh,
+                   available_providers={"gemini"})
+
+    # urgency=1.0 (max) → threshold=-1.0; strict gate excludes scalar=-1.0
+    result = sel.select(task="coder", difficulty=5, urgency=1.0)
+    assert result is None, (
+        "free-tier RPM=0 must hold dispatch even at max urgency — got "
+        f"pick={result.model.name if result else None}"
+    )
+
+
+def test_select_coding_specialty_rejected_for_non_code_task():
+    coding_model = _make_model("code-specialist", specialty="coding")
+    sel = _make_selector([coding_model])
+    result = sel.select(task="planner", difficulty=5)
+    assert result is None
+
+
+def test_select_coding_specialty_accepted_for_code_task():
+    coding_model = _make_model("code-specialist", specialty="coding")
+    sel = _make_selector([coding_model])
+    result = sel.select(task="coder", difficulty=5)
+    assert result is not None

@@ -1,0 +1,408 @@
+# auto_tuner.py
+"""
+Auto-tuner: blends profile scores, benchmark scores, and empirical
+grading data to keep per-model capability vectors up to date.
+
+Runs periodically (every 6 h by default) as a batch recalibration.
+
+Relocated 2026-06-07 from src/models/auto_tuner.py — it tunes the
+capability vectors fatih_hoca ranks on, so it belongs in fatih_hoca.
+The move also removes a package->src dependency inversion (fatih_hoca's
+init previously reached back into src.models for blend_capability_scores).
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any
+
+from yazbunu import get_logger
+from .capabilities import TASK_PROFILES, Cap
+
+log = get_logger("auto_tuner")
+
+# ─── Constants ───────────────────────────────────────────────────────────────
+
+TUNING_INTERVAL_SECONDS = 6 * 3600  # 6 hours
+MIN_CHANGE_THRESHOLD = 0.2          # ignore noisy sub-0.2 diffs
+
+_last_run_ts: float = 0.0
+
+# ─── Blend Weight Schedule ───────────────────────────────────────────────────
+# (min_calls, grading_weight, benchmark_weight, profile_weight)
+
+_BLEND_SCHEDULE: list[tuple[int, float, float, float]] = [
+    (50,  0.50, 0.30, 0.20),
+    (20,  0.35, 0.39, 0.26),
+    (5,   0.20, 0.48, 0.32),
+    (0,   0.00, 0.60, 0.40),
+]
+
+
+def _get_blend_weights(call_count: int) -> tuple[float, float, float]:
+    """Return (grading_w, benchmark_w, profile_w) for a given call count."""
+    for min_calls, gw, bw, pw in _BLEND_SCHEDULE:
+        if call_count >= min_calls:
+            return gw, bw, pw
+    # fallback (should not be reached)
+    return 0.0, 0.60, 0.40
+
+
+# ─── Core Blend ──────────────────────────────────────────────────────────────
+
+def blend_capability_scores(
+    profile_scores: dict[str, float],
+    benchmark_scores: dict[str, float],
+    grading_scores: dict[str, float],
+    grading_call_count: int,
+) -> dict[str, float]:
+    """
+    Blend three signal sources into a single capability vector.
+
+    For each dimension:
+    - If grading data exists AND call_count >= 5 → 3-way blend
+    - Otherwise → 2-way blend (60% benchmark + 40% profile)
+
+    Returns dict[str, float] with all values clamped to [0, 10].
+    """
+    all_caps = set(profile_scores) | set(benchmark_scores) | set(grading_scores)
+    grading_w, bench_w, profile_w = _get_blend_weights(grading_call_count)
+
+    result: dict[str, float] = {}
+    for cap in all_caps:
+        p = profile_scores.get(cap, 0.0)
+        b = benchmark_scores.get(cap)  # None if no benchmark data
+        g = grading_scores.get(cap, 0.0)
+
+        has_bench = b is not None and b > 0
+        has_grading = cap in grading_scores and grading_call_count >= 5
+
+        if has_grading and has_bench:
+            # 3-way blend: grading + benchmark + profile
+            score = grading_w * g + bench_w * b + profile_w * p
+        elif has_grading:
+            # 2-way: grading + profile (no benchmark for this dimension)
+            gw_adj = grading_w + bench_w * 0.6  # redistribute bench weight
+            pw_adj = profile_w + bench_w * 0.4
+            score = gw_adj * g + pw_adj * p
+        elif has_bench:
+            # 2-way: benchmark + profile
+            score = 0.60 * b + 0.40 * p
+        else:
+            # No external signal — keep profile score as-is
+            score = p
+
+        result[cap] = round(min(10.0, max(0.0, score)), 2)
+
+    return result
+
+
+# ─── Grading Score Computation ───────────────────────────────────────────────
+
+def compute_grading_scores(
+    model_name: str,
+    stats_rows: list[dict],
+) -> tuple[dict[str, float], int]:
+    """
+    Convert model_stats rows into a capability score dict.
+
+    Each row has: model, agent_type, avg_grade (1-5), success_rate (0-1),
+    total_calls.
+
+    Only rows whose ``model`` field matches *model_name* are considered
+    (defensive filtering — callers may pass the full stats list).
+
+    Steps:
+    1. Filter rows to matching model_name.
+    2. Map agent_type -> TASK_PROFILES -> find dominant capabilities (weight >= 0.3).
+    3. Convert grade to quality: avg_grade * 2.0 * (0.5 + 0.5 * success_rate).
+    4. Distribute quality across capabilities weighted by profile weights.
+    5. Call-count-weighted average per capability: each agent_type's
+       contribution is weighted by ``min(calls, 50)`` so agent_types with
+       more observations have more influence.
+
+    Returns (scores_dict, total_call_count).
+    """
+    # Accumulate (weighted_quality * effective_weight, effective_weight) per cap
+    cap_weighted_sum: dict[str, float] = {}
+    cap_weight_total: dict[str, float] = {}
+    total_calls = 0
+
+    for row in stats_rows:
+        row_model = row.get("model", "")
+        if row_model != model_name:
+            continue
+
+        agent_type = row.get("agent_type", "")
+        avg_grade = row.get("avg_grade", 0.0)
+        success_rate = row.get("success_rate", 0.0)
+        calls = row.get("total_calls", 0)
+
+        profile = TASK_PROFILES.get(agent_type)
+        if not profile:
+            log.debug(f"no task profile for agent_type={agent_type}, skipping")
+            continue
+
+        total_calls += calls
+
+        # quality on 0-10 scale
+        quality = avg_grade * 2.0 * (0.5 + 0.5 * success_rate)
+
+        # effective_weight: more calls = more influence, capped at 50
+        effective_calls = min(calls, 50)
+
+        for cap_key, weight in profile.items():
+            cap_name = cap_key.value if isinstance(cap_key, Cap) else cap_key
+            if weight < 0.3:
+                continue
+            w = weight * effective_calls
+            cap_weighted_sum[cap_name] = (
+                cap_weighted_sum.get(cap_name, 0.0) + quality * w
+            )
+            cap_weight_total[cap_name] = (
+                cap_weight_total.get(cap_name, 0.0) + w
+            )
+
+    # Weighted average per capability
+    scores: dict[str, float] = {}
+    for cap_name, ws in cap_weighted_sum.items():
+        wt = cap_weight_total[cap_name]
+        if wt > 0:
+            scores[cap_name] = round(min(10.0, max(0.0, ws / wt)), 2)
+
+    return scores, total_calls
+
+
+# ─── Tuning Cycle ────────────────────────────────────────────────────────────
+
+async def run_tuning_cycle() -> dict[str, Any]:
+    """
+    Batch recalibration of all model capability vectors.
+
+    1. Read model_stats from DB.
+    2. For each model: get profile_scores, benchmark_scores, compute
+       grading_scores, blend.
+    3. Only update capabilities where |change| > 0.2.
+
+    Returns a report dict.
+    """
+    from dabidabi import get_model_stats
+    from src.models.model_registry import get_registry
+
+    global _last_run_ts
+
+    registry = get_registry()
+    all_stats = await get_model_stats()
+
+    # Group stats by model
+    stats_by_model: dict[str, list[dict]] = {}
+    for row in all_stats:
+        model_name = row.get("model", "")
+        if model_name:
+            stats_by_model.setdefault(model_name, []).append(row)
+
+    tuned: dict[str, dict] = {}
+    skipped: list[str] = []
+
+    for model_name, model_info in registry.models.items():
+        # Profile scores — from ModelInfo (may not be populated yet)
+        profile_scores = getattr(model_info, "profile_scores", None) or {}
+        if not profile_scores:
+            # Fall back to current capabilities as profile baseline
+            profile_scores = dict(model_info.capabilities)
+
+        # Benchmark scores — only use real benchmark data, not fallback
+        benchmark_scores = getattr(model_info, "benchmark_scores", None) or {}
+
+        # Grading scores from DB — try registry name first, then litellm_name,
+        # then base_model_name (thinking variants share grading with base)
+        stats_key = model_name
+        model_stats = stats_by_model.get(model_name, [])
+        if not model_stats:
+            litellm_name = getattr(model_info, "litellm_name", "")
+            if litellm_name and litellm_name != model_name:
+                model_stats = stats_by_model.get(litellm_name, [])
+                if model_stats:
+                    stats_key = litellm_name
+        if not model_stats:
+            base_name = getattr(model_info, "base_model_name", "")
+            if base_name and base_name != model_name:
+                model_stats = stats_by_model.get(base_name, [])
+                if model_stats:
+                    stats_key = base_name
+        grading_scores, grading_calls = compute_grading_scores(
+            stats_key, model_stats
+        )
+
+        if not grading_scores and not benchmark_scores:
+            skipped.append(model_name)
+            continue
+
+        blended = blend_capability_scores(
+            profile_scores, benchmark_scores, grading_scores, grading_calls
+        )
+
+        # Only apply changes above threshold
+        changes: dict[str, dict[str, float]] = {}
+        for cap, new_val in blended.items():
+            old_val = model_info.capabilities.get(cap, 0.0)
+            if abs(new_val - old_val) > MIN_CHANGE_THRESHOLD:
+                changes[cap] = {"old": old_val, "new": new_val}
+                model_info.capabilities[cap] = new_val
+
+        grading_w, _, _ = _get_blend_weights(grading_calls)
+
+        if changes:
+            tuned[model_name] = {
+                "changes": changes,
+                "grading_calls": grading_calls,
+                "grading_weight": grading_w,
+            }
+            signals = []
+            if benchmark_scores:
+                signals.append(f"bench={len(benchmark_scores)}d")
+            if grading_calls > 0:
+                signals.append(f"grading={grading_calls}calls,w={grading_w:.0%}")
+            if not signals:
+                signals.append("profile-only")
+            log.info(
+                f"tuned {model_name}: {len(changes)} caps adjusted "
+                f"({', '.join(signals)})"
+            )
+        else:
+            skipped.append(model_name)
+
+    _last_run_ts = time.time()
+    report = {
+        "tuned_models": tuned,
+        "skipped": skipped,
+        "timestamp": _last_run_ts,
+    }
+    log.info(f"tuning cycle complete: {len(tuned)} tuned, {len(skipped)} skipped")
+    return report
+
+
+async def maybe_run_tuning(force: bool = False) -> dict[str, Any] | None:
+    """Run tuning if 6+ hours since last run, or if force=True."""
+    global _last_run_ts
+    if not force and time.time() - _last_run_ts < TUNING_INTERVAL_SECONDS:
+        return None
+    return await run_tuning_cycle()
+
+
+# ─── Prometheus Metrics ──────────────────────────────────────────────────────
+
+
+def _prom_escape_label(value: str) -> str:
+    """Escape a Prometheus label value (inside double quotes).
+
+    Per the exposition format spec, backslash, double-quote, and newline
+    must be escaped.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def get_prometheus_lines() -> list[str]:
+    """
+    Generate Prometheus-format gauge lines for all model capabilities.
+
+    Metrics emitted:
+    - kutay_model_capability{model="...",capability="..."} <value>
+    - kutay_model_quality_avg{model="..."} <value>
+    - kutay_autotuner_last_run_timestamp <value>
+    - kutay_autotuner_interval_seconds <value>
+    """
+    from src.models.model_registry import get_registry
+
+    registry = get_registry()
+    lines: list[str] = []
+
+    # ── kutay_model_capability ──
+    lines.append("# HELP kutay_model_capability Model capability score by dimension")
+    lines.append("# TYPE kutay_model_capability gauge")
+    for model_name, model_info in registry.models.items():
+        m = _prom_escape_label(model_name)
+        caps = model_info.capabilities
+        for cap_name, cap_val in caps.items():
+            c = _prom_escape_label(
+                cap_name.value if isinstance(cap_name, Cap) else str(cap_name)
+            )
+            lines.append(
+                f'kutay_model_capability{{model="{m}",'
+                f'capability="{c}"}} {cap_val}'
+            )
+
+    # ── kutay_model_quality_avg ──
+    lines.append("# HELP kutay_model_quality_avg Average capability score across all dimensions")
+    lines.append("# TYPE kutay_model_quality_avg gauge")
+    for model_name, model_info in registry.models.items():
+        m = _prom_escape_label(model_name)
+        caps = model_info.capabilities
+        if caps:
+            avg = round(sum(caps.values()) / len(caps), 2)
+            lines.append(
+                f'kutay_model_quality_avg{{model="{m}"}} {avg}'
+            )
+
+    # ── kutay_autotuner_last_run_timestamp ──
+    lines.append("# HELP kutay_autotuner_last_run_timestamp Unix timestamp of last tuning run")
+    lines.append("# TYPE kutay_autotuner_last_run_timestamp gauge")
+    lines.append(f"kutay_autotuner_last_run_timestamp {_last_run_ts}")
+
+    # ── kutay_autotuner_interval_seconds ──
+    lines.append("# HELP kutay_autotuner_interval_seconds Configured tuning interval in seconds")
+    lines.append("# TYPE kutay_autotuner_interval_seconds gauge")
+    lines.append(f"kutay_autotuner_interval_seconds {TUNING_INTERVAL_SECONDS}")
+
+    return lines
+
+
+async def get_prometheus_lines_async() -> list[str]:
+    """
+    Extended Prometheus metrics including DB-sourced model_stats.
+
+    Adds to the sync metrics:
+    - kutay_model_success_rate{model,agent_type}
+    - kutay_model_avg_grade{model,agent_type}
+    - kutay_model_total_calls{model,agent_type}
+    - kutay_model_avg_latency_ms{model,agent_type}
+    - kutay_model_avg_cost{model,agent_type}
+    """
+    lines = get_prometheus_lines()
+
+    try:
+        from dabidabi import get_model_stats
+        stats = await get_model_stats()
+
+        if stats:
+            lines.append("# HELP kutay_model_success_rate Model success rate by agent type")
+            lines.append("# TYPE kutay_model_success_rate gauge")
+            lines.append("# HELP kutay_model_avg_grade Model average grade (1-5) by agent type")
+            lines.append("# TYPE kutay_model_avg_grade gauge")
+            lines.append("# HELP kutay_model_total_calls Model total calls by agent type")
+            lines.append("# TYPE kutay_model_total_calls counter")
+            lines.append("# HELP kutay_model_avg_latency_ms Model average latency by agent type")
+            lines.append("# TYPE kutay_model_avg_latency_ms gauge")
+            lines.append("# HELP kutay_model_avg_cost Model average cost per call by agent type")
+            lines.append("# TYPE kutay_model_avg_cost gauge")
+
+            for row in stats:
+                model = _prom_escape_label(row["model"])
+                agent = _prom_escape_label(row["agent_type"])
+                labels = f'model="{model}",agent_type="{agent}"'
+
+                sr = row.get("success_rate", 0) or 0
+                grade = row.get("avg_grade", 0) or 0
+                calls = row.get("total_calls", 0) or 0
+                latency = row.get("avg_latency", 0) or 0
+                cost = row.get("avg_cost", 0) or 0
+
+                lines.append(f"kutay_model_success_rate{{{labels}}} {sr:.3f}")
+                lines.append(f"kutay_model_avg_grade{{{labels}}} {grade:.2f}")
+                lines.append(f"kutay_model_total_calls{{{labels}}} {calls}")
+                lines.append(f"kutay_model_avg_latency_ms{{{labels}}} {latency:.1f}")
+                lines.append(f"kutay_model_avg_cost{{{labels}}} {cost:.6f}")
+    except Exception as e:
+        log.debug(f"model_stats prometheus export failed: {e}")
+
+    return lines
